@@ -1,52 +1,93 @@
-# IT Audit Workbench
+# Audit Workbench
 
-A single-file, offline tool for IT auditors to plan engagements, run control tests, collect evidence, and rate issues by criticality.
+Audit Workbench is a self-hosted, multi-user audit management application for IT audit teams. It covers the full cycle from the risk-based audit universe to issue follow-up, with reviewer sign-off and a complete audit trail.
 
-## Run it
+It needs only **Python 3.9+**. There are no packages to install and no internet access is required. Data stays on your own server in a SQLite database and an evidence folder.
 
-Open `index.html` in Chrome, Edge, or Firefox. You don't need to install anything, and it never makes a network call.
-Your data is saved in the browser's local storage (IndexedDB) on your machine.
+## Quick start
 
-## What it does
+```bash
+python3 server.py                       # http://127.0.0.1:8080, data in ./data
+```
 
-| Tab | Purpose |
+On first start, the console prints a one-time `admin` password, which must be changed at first sign-in. You can also set it yourself with `AUDIT_ADMIN_PASSWORD=...`. Sign in as admin and add your team under **Admin → Users**.
+
+To let the team use it over the network:
+
+```bash
+python3 server.py --host 0.0.0.0 --port 8080 --data /srv/audit-data --secure-cookie
+```
+
+Put it behind your HTTPS reverse proxy (nginx, IIS, Caddy) and use `--secure-cookie` there. Back up the `--data` folder, which holds `audit.db` and `evidence/`, with your normal server backups.
+
+## Roles
+
+| Role | Can do |
 |---|---|
-| **Dashboard** | Testing progress, conclusions, open issues by criticality, a 5x5 risk heat map, and overdue tests or issues. |
-| **Planning** | Engagement details (framework, audit period, fieldwork dates, team, objectives, scope, out of scope) and an inherent-risk assessment of auditable areas, ranked by score. |
-| **Audit tests** | Control tests: control ID and description, framework reference, nature, frequency, key-control flag, test method, procedure, population, sample size, exceptions, tester and reviewer, due date, status, and conclusion. **Add from ITGC library** adds standard access, change, operations, backup, network, and incident controls. |
-| **Evidence** | PBC request tracking (requested, received, accepted, rejected) with file attachments. Each file is stored with a **SHA-256 fingerprint**, which shows it hasn't changed since collection. |
-| **Issues** | Findings in condition / criteria / cause / effect / recommendation form, with management owner, due date, status, and response. You can raise an issue straight from an ineffective or partially effective test. |
-| **Report** | Draft report: executive summary, scope, detailed findings ordered by criticality, and the controls tested. You can print it or save it as PDF. Issues and tests also export to CSV. |
+| **Administrator** | Everything, including managing user accounts. |
+| **Audit manager** | Manage the audit universe, annual plan and engagements. Sign off as **reviewer**. Clear review notes. View the full audit trail. |
+| **Auditor** | Prepare workpapers, collect evidence, raise issues, log time, respond to review notes, and sign off as **preparer**. An auditor who is an engagement's lead can also edit that engagement. |
+| **Auditee** | Sees **only the issues they own**. Can record a management response and move the issue to "Remediation in progress" or "Ready for validation". |
 
-### Criticality rating
+## Features
 
-Score = Likelihood (1-5) x Impact (1-5)
+**Audit universe and annual plan.** Rate each auditable entity (system, process, vendor) by likelihood × impact and set an audit cycle. The next-due date is calculated from the last audit. Add entities to a yearly plan with quarter, lead and budget hours, then start an engagement from a plan item in one click.
 
-| Score | Criticality |
+**Engagements.** Each engagement records objectives, scope, out-of-scope items, framework (SOX ITGC, ISO 27001, NIST, COBIT, PCI, SOC 2), audit period, fieldwork dates, team and budget. Planning includes a risk assessment that ranks areas so testing goes to the highest-risk ones.
+
+**Workpapers.** One workpaper per control test: control description, framework reference, nature, frequency and key-control flag, test method, procedure, population, sample size and exceptions. Choosing the control frequency fills in a suggested sample size. **Add from ITGC library** loads 12 standard controls covering access, change, operations, backup, network and incident management.
+
+**Sign-off and review**, which follow the usual audit-file controls:
+- The preparer signs off once a conclusion is recorded.
+- Only a manager can sign off as reviewer, and **never on their own work** (segregation of duties).
+- Reviewers raise **review notes**. The preparer responds, and the reviewer clears the note. Any open note blocks review sign-off.
+- **Editing the content of a signed-off workpaper removes its sign-offs**, so it must be re-reviewed. Changes to administrative fields such as due date or assignee keep the sign-offs.
+
+**Evidence and PBC requests.** Track each request as requested, received, accepted, or rejected and to be resubmitted. Attach files of up to 50 MB each. Each file is stored with a **SHA-256 fingerprint**, and every upload, download and removal is logged.
+
+**Issues.** Findings are written as condition, criteria, cause, effect and recommendation, with a management owner, due date, status and response. **Criticality = likelihood × impact**:
+
+| Score | Rating |
 |---|---|
-| 20-25 | Critical |
-| 12-19 | High |
-| 6-11 | Medium |
-| 1-5 | Low |
+| 20–25 | Critical |
+| 12–19 | High |
+| 6–11 | Medium |
+| 1–5 | Low |
 
-### Suggested sample sizes
+You can raise an issue straight from a failed workpaper. The **Issue tracker** covers every engagement, with filters and CSV export. Closing an issue records who validated it.
 
-When you pick a control frequency, a sample size is suggested. The lower bound applies to non-key controls and the upper bound to key controls.
+**Time.** Log hours by activity. Budget vs actual is shown per engagement, per person and across the plan.
 
-| Frequency | Sample size |
-|---|---|
-| Annual | 1 |
-| Quarterly | 2 |
-| Monthly | 2-5 |
-| Weekly | 5-15 |
-| Daily | 20-40 |
-| Multiple times per day | 25-60 |
-| Automated | 1 (test of one plus change controls) |
-| As needed | 10-25 |
+**Dashboards and reports.**
+- **Home** shows *My tasks*: workpapers to complete, notes to answer, workpapers to review, and responses to clear. It also has the engagement portfolio, a criticality heat map and overdue issues.
+- **Report** produces a draft report that you can print or save as PDF, plus CSV exports.
 
-Change these to match your firm's methodology in `SAMPLE_GUIDE` inside `index.html`. Edit `criticality()` the same way to change the rating bands.
+**Audit trail.** Every create, edit (with old → new values), delete, sign-off, upload, download and sign-in is logged. Managers can view it per workpaper, per engagement, or for everything.
 
-## Backups and sharing
+## Working as a team
 
-Data stays only in the browser where you entered it. To keep a copy or move it to another machine, use **Backup**: it saves one JSON file with all records and evidence files. **Restore** merges a backup back in.
-Evidence may be sensitive, so store backup files under your organisation's data-handling rules.
+- Two people editing the same record is handled safely: the second save is refused with "someone else changed this record". The record is never silently overwritten.
+- The page reloads the latest data when you return to the browser tab, or when you press **Refresh**.
+
+## Security notes
+
+- Passwords are hashed with PBKDF2-SHA256 (240k iterations) and must be at least 10 characters. New and reset accounts must change their password at next sign-in.
+- After 5 failed sign-in attempts, the account is locked for 5 minutes.
+- Sessions use HttpOnly, SameSite=Strict cookies, and writes require a custom request header. A strict Content-Security-Policy and anti-framing headers are sent.
+- Disabling a user or resetting their password ends their sessions.
+- **Not included:** SSO/LDAP and e-mail notifications. Use HTTPS in front of the server for any network use.
+
+## Customising
+
+- **Rating bands:** `criticality()` in `static/app.js`.
+- **Sample sizes:** `SAMPLE_GUIDE` in `static/app.js`.
+- **Control library:** `LIBRARY` in `static/app.js`.
+- **Field lists** (frameworks, statuses, evidence types): `SCHEMAS` in `static/app.js`.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The tests cover permissions, segregation of duties, sign-off invalidation, review-note blocking, auditee isolation, evidence hashing, optimistic locking, cascade deletes and the audit trail.
