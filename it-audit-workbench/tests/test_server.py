@@ -171,6 +171,45 @@ class WorkbenchTest(unittest.TestCase):
         self.mgr.ok('DELETE', 'evidence/' + ev['id'])
         self.assertFalse((Path(self.tmp.name) / 'evidence' / f['id']).exists())
 
+    def test_attach_file_directly_to_test(self):
+        e, wp = self.engagement()
+        content = b'samaccountname,enabled,lastlogon\nalice,True,2026-09-30\n'
+        res = self.aud.ok('POST', f"workpapers/{wp['id']}/attach", raw=content, headers={
+            'X-Filename': 'AD%20users%20extract.csv', 'Content-Type': 'text/csv',
+            'X-Purpose': 'Population%20(e.g.%20user%20extraction)', 'X-Description': 'AD%20extraction%20as%20at%2030%20Sep'})
+        ev, f = res['evidence'], res['file']
+        self.assertEqual((ev['workpaper_id'], ev['title'], ev['purpose'], ev['pbc_status']),
+                         (wp['id'], 'AD extraction as at 30 Sep', 'Population (e.g. user extraction)', 'Received'))
+        self.assertEqual((f['evidence_id'], f['name'], f['sha256']), (ev['id'], 'AD users extract.csv', hashlib.sha256(content).hexdigest()))
+        self.assertEqual(self.mgr.req('GET', 'files/' + f['id']), (200, content))
+        self.assertEqual(self.mgr.ok('GET', 'evidence?workpaper_id=' + wp['id'])[0]['id'], ev['id'])
+        # No description: the file name becomes the title.
+        res = self.aud.ok('POST', f"workpapers/{wp['id']}/attach", raw=b'x', headers={'X-Filename': 'sample.xlsx'})
+        self.assertEqual(res['evidence']['title'], 'sample.xlsx')
+
+    def test_attach_rejections(self):
+        e, wp = self.engagement()
+        self.assertEqual(self.aud.req('POST', f"workpapers/{wp['id']}/attach", raw=b'', headers={'X-Filename': 'a.csv'})[0], 400)
+        self.assertEqual(self.owner.req('POST', f"workpapers/{wp['id']}/attach", raw=b'x', headers={'X-Filename': 'a.csv'})[0], 403)
+        self.assertEqual(self.aud.req('POST', 'workpapers/nope/attach', raw=b'x', headers={'X-Filename': 'a.csv'})[0], 404)
+        self.assertEqual(self.mgr.ok('GET', 'evidence?workpaper_id=' + wp['id']), [])
+
+    def test_changing_evidence_on_signed_test_removes_signoffs(self):
+        e, wp = self.engagement()
+        first = self.aud.ok('POST', f"workpapers/{wp['id']}/attach", raw=b'users', headers={'X-Filename': 'users.csv'})
+        self.aud.ok('PUT', 'workpapers/' + wp['id'], {'result': 'Effective'})
+        self.aud.ok('POST', f"workpapers/{wp['id']}/signoff", {'kind': 'prepare'})
+        self.mgr.ok('POST', f"workpapers/{wp['id']}/signoff", {'kind': 'review'})
+        self.aud.ok('POST', f"workpapers/{wp['id']}/attach", raw=b'more', headers={'X-Filename': 'late.csv'})
+        wp1 = self.mgr.ok('GET', 'workpapers/' + wp['id'])
+        self.assertEqual((wp1['reviewed_by'], wp1['status']), (None, 'In progress'))
+        # Removing a file from a re-signed test also removes the sign-offs.
+        self.aud.ok('POST', f"workpapers/{wp['id']}/signoff", {'kind': 'prepare'})
+        self.aud.ok('DELETE', 'files/' + first['file']['id'])
+        self.assertIsNone(self.mgr.ok('GET', 'workpapers/' + wp['id'])['prepared_by'])
+        reasons = [json.loads(r['detail'])['reason'] for r in self.mgr.ok('GET', 'audit_log?record_id=' + wp['id']) if r['action'] == 'signoffs_removed']
+        self.assertEqual(reasons, ['evidence removed: users.csv', 'evidence added: late.csv'])
+
     def test_auditee_sees_and_answers_only_own_issues(self):
         e, wp = self.engagement()
         mine = self.aud.ok('POST', 'issues', {'engagement_id': e['id'], 'title': 'Leavers not removed', 'owner_id': self.uid['owner'],

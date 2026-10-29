@@ -50,7 +50,7 @@ TABLES = {
                    'key_control', 'test_type', 'procedure', 'population', 'sample_size', 'exceptions', 'assigned_to',
                    'due_date', 'status', 'result', 'notes',
                    'prepared_by', 'prepared_at', 'reviewed_by', 'reviewed_at'],
-    'evidence': ['engagement_id', 'workpaper_id', 'issue_id', 'title', 'type', 'pbc_status', 'requested_from', 'requested_on',
+    'evidence': ['engagement_id', 'workpaper_id', 'issue_id', 'title', 'purpose', 'type', 'pbc_status', 'requested_from', 'requested_on',
                  'collected_by', 'collected_on', 'notes'],
     'files': ['evidence_id', 'engagement_id', 'name', 'size', 'content_type', 'sha256'],
     'review_notes': ['engagement_id', 'workpaper_id', 'note', 'status', 'response',
@@ -434,6 +434,8 @@ class Workbench:
             elif table == 'evidence':
                 file_ids = [r['id'] for r in c.execute('SELECT id FROM files WHERE evidence_id = ?', (rid,))]
                 c.execute('DELETE FROM files WHERE evidence_id = ?', (rid,))
+                if file_ids and row.get('workpaper_id'):
+                    self._invalidate_signoffs(c, user, row['workpaper_id'], f"evidence removed: {row.get('title')}")
             elif table == 'workpapers':
                 c.execute('DELETE FROM review_notes WHERE workpaper_id = ?', (rid,))
                 c.execute('UPDATE evidence SET workpaper_id = NULL WHERE workpaper_id = ?', (rid,))
@@ -513,14 +515,15 @@ class Workbench:
             return self._row(c, 'review_notes', note_id)
 
     # ---------- evidence files ----------
-    def save_file(self, user, evidence_id, name, content_type, stream, length):
+    def _receive(self, user, name, stream, length):
+        """Stream an upload to disk, hashing as it goes. Returns (file_id, clean_name, sha256)."""
         if user['role'] not in STAFF:
             raise ApiError(403, 'Not permitted.')
+        if length <= 0:
+            raise ApiError(400, 'The file is empty.')
         if length > MAX_UPLOAD:
             raise ApiError(413, f'Files are limited to {MAX_UPLOAD // (1024 * 1024)} MB.')
         name = re.sub(r'[\x00-\x1f/\\]', '_', name or 'file').strip()[:200] or 'file'
-        with self.db() as c:
-            ev = self._row(c, 'evidence', evidence_id)
         fid, h, remaining = new_id(), hashlib.sha256(), length
         tmp = self.file_dir / (fid + '.part')
         with open(tmp, 'wb') as f:
@@ -533,14 +536,62 @@ class Workbench:
             tmp.unlink(missing_ok=True)
             raise ApiError(400, 'Upload was incomplete.')
         tmp.rename(self.file_dir / fid)
+        return fid, name, h.hexdigest()
+
+    def _insert_file(self, c, user, fid, ev, name, content_type, length, sha):
         ts = now()
-        rec = {'id': fid, 'evidence_id': evidence_id, 'engagement_id': ev['engagement_id'], 'name': name, 'size': str(length),
-               'content_type': (content_type or 'application/octet-stream')[:100], 'sha256': h.hexdigest(),
+        rec = {'id': fid, 'evidence_id': ev['id'], 'engagement_id': ev['engagement_id'], 'name': name, 'size': str(length),
+               'content_type': (content_type or 'application/octet-stream')[:100], 'sha256': sha,
                'created_at': ts, 'created_by': user['id'], 'updated_at': ts, 'updated_by': user['id']}
-        with self.db() as c:
-            c.execute(f'INSERT INTO files ({", ".join(rec)}) VALUES ({", ".join("?" * len(rec))})', list(rec.values()))
-            self._log(c, user, 'upload', 'files', fid, ev['engagement_id'], {'name': name, 'sha256': rec['sha256'], 'evidence_id': evidence_id})
+        c.execute(f'INSERT INTO files ({", ".join(rec)}) VALUES ({", ".join("?" * len(rec))})', list(rec.values()))
+        self._log(c, user, 'upload', 'files', fid, ev['engagement_id'], {'name': name, 'sha256': sha, 'evidence_id': ev['id']})
+        if ev.get('workpaper_id'):
+            self._invalidate_signoffs(c, user, ev['workpaper_id'], f'evidence added: {name}')
         return rec
+
+    def _invalidate_signoffs(self, c, user, wp_id, reason):
+        """Changing the evidence behind a signed-off workpaper means it must be signed off again."""
+        wp = c.execute('SELECT * FROM workpapers WHERE id = ?', (wp_id,)).fetchone()
+        if not wp or not (wp['prepared_by'] or wp['reviewed_by']):
+            return
+        c.execute("""UPDATE workpapers SET prepared_by = NULL, prepared_at = NULL, reviewed_by = NULL, reviewed_at = NULL,
+                     status = 'In progress', updated_at = ?, updated_by = ? WHERE id = ?""", (now(), user['id'], wp_id))
+        self._log(c, user, 'signoffs_removed', 'workpapers', wp_id, wp['engagement_id'], {'reason': reason})
+
+    def save_file(self, user, evidence_id, name, content_type, stream, length):
+        if user['role'] not in STAFF:
+            raise ApiError(403, 'Not permitted.')
+        with self.db() as c:
+            ev = self._row(c, 'evidence', evidence_id)
+        fid, name, sha = self._receive(user, name, stream, length)
+        try:
+            with self.db() as c:
+                return self._insert_file(c, user, fid, ev, name, content_type, length, sha)
+        except BaseException:
+            (self.file_dir / fid).unlink(missing_ok=True)
+            raise
+
+    def attach_to_workpaper(self, user, wp_id, name, content_type, stream, length, purpose=None, description=None):
+        """One-step upload next to a test: creates the evidence record and stores the file together."""
+        if user['role'] not in STAFF:
+            raise ApiError(403, 'Not permitted.')
+        with self.db() as c:
+            wp = self._row(c, 'workpapers', wp_id)
+        fid, name, sha = self._receive(user, name, stream, length)
+        ts = now()
+        ev = {'id': new_id(), 'engagement_id': wp['engagement_id'], 'workpaper_id': wp_id, 'title': (description or '').strip()[:500] or name,
+              'purpose': (purpose or '').strip()[:100] or None, 'pbc_status': 'Received', 'collected_by': user.get('name'),
+              'collected_on': ts[:10], 'created_at': ts, 'created_by': user['id'], 'updated_at': ts, 'updated_by': user['id']}
+        try:
+            with self.db() as c:
+                c.execute(f'INSERT INTO evidence ({", ".join(ev)}) VALUES ({", ".join("?" * len(ev))})', list(ev.values()))
+                self._log(c, user, 'create', 'evidence', ev['id'], wp['engagement_id'],
+                          {k: ev[k] for k in ('title', 'purpose', 'workpaper_id') if ev[k]})
+                f = self._insert_file(c, user, fid, ev, name, content_type, length, sha)
+        except BaseException:
+            (self.file_dir / fid).unlink(missing_ok=True)
+            raise
+        return {'evidence': ev, 'file': f}
 
     def open_file(self, user, fid):
         if user['role'] not in STAFF:
@@ -559,6 +610,9 @@ class Workbench:
                 raise ApiError(403, 'Only the uploader or a manager can remove a file.')
             c.execute('DELETE FROM files WHERE id = ?', (fid,))
             self._log(c, user, 'delete', 'files', fid, rec['engagement_id'], {'name': rec['name'], 'sha256': rec['sha256']})
+            ev = c.execute('SELECT workpaper_id FROM evidence WHERE id = ?', (rec['evidence_id'],)).fetchone()
+            if ev and ev['workpaper_id']:
+                self._invalidate_signoffs(c, user, ev['workpaper_id'], f"evidence removed: {rec['name']}")
         (self.file_dir / fid).unlink(missing_ok=True)
 
 
@@ -676,6 +730,11 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length') or 0)
             name = unquote(self.headers.get('X-Filename') or 'file')
             return self._json(201, app.save_file(user, rest[0], name, self.headers.get('Content-Type'), self.rfile, length))
+        elif head == 'workpapers' and len(rest) == 2 and rest[1] == 'attach' and method == 'POST':
+            h = self.headers
+            return self._json(201, app.attach_to_workpaper(user, rest[0], unquote(h.get('X-Filename') or 'file'), h.get('Content-Type'),
+                                                           self.rfile, int(h.get('Content-Length') or 0),
+                                                           unquote(h.get('X-Purpose') or ''), unquote(h.get('X-Description') or '')))
         elif head == 'files' and len(rest) == 1 and method == 'GET':
             rec, path = app.open_file(user, rest[0])
             data = path.read_bytes()

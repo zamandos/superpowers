@@ -43,6 +43,13 @@ Put it behind your HTTPS reverse proxy (nginx, IIS, Caddy) and use `--secure-coo
 - Reviewers raise **review notes**. The preparer responds, and the reviewer clears the note. Any open note blocks review sign-off.
 - **Editing the content of a signed-off workpaper removes its sign-offs**, so it must be re-reviewed. Changes to administrative fields such as due date or assignee keep the sign-offs.
 
+**Attaching evidence to a test.** Every workpaper has a **Test evidence** panel directly below the test procedure. To attach a file:
+1. Pick what the file is: population (e.g. a user extraction), sample selection, testing performed, supporting documentation, or exception follow-up.
+2. Optionally describe it, e.g. "AD user extraction as at 30 Sep, 1,204 accounts".
+3. Drag the file onto the panel or click **Choose files**.
+
+Several files can go up at once, with a progress bar. The workpapers list also has an **Attach** link on every row, and it shows how many files each test has. Attaching or removing evidence on a signed-off test removes its sign-offs, so the reviewer sees the change.
+
 **Evidence and PBC requests.** Track each request as requested, received, accepted, or rejected and to be resubmitted. Attach files of up to 50 MB each. Each file is stored with a **SHA-256 fingerprint**, and every upload, download and removal is logged.
 
 **Issues.** Findings are written as condition, criteria, cause, effect and recommendation, with a management owner, due date, status and response. **Criticality = likelihood × impact**:

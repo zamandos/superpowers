@@ -80,3 +80,6 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--chip)}
 .kv td{white-space:pre-wrap}
 .over{color:var(--crit);font-weight:600}
 @media print{nav.sub,.no-print{display:none}}
+.dropzone{border:2px dashed var(--line);border-radius:8px;padding:20px;text-align:center;margin:12px 0}
+[data-drop].over-drop .dropzone{border-color:var(--accent);background:var(--chip)}
+label.link{color:var(--accent);cursor:pointer;font-weight:normal}

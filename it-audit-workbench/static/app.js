@@ -29,6 +29,7 @@ const L5 = [['1','1 - Rare'],['2','2 - Unlikely'],['3','3 - Possible'],['4','4 -
 const I5 = [['1','1 - Minimal'],['2','2 - Minor'],['3','3 - Moderate'],['4','4 - Major'],['5','5 - Severe']];
 const AREAS = ['Logical access','Privileged access','Change management','IT operations / job scheduling','Backup & recovery','Network security',
   'Vendor / third-party management','Data protection','Physical security','Incident management','Cloud security','Business continuity'];
+const PURPOSES = ['Population (e.g. user extraction)','Sample selection','Testing performed / tick-marked results','Supporting documentation','Exception follow-up'];
 const SCHEMAS = {
   universe:{label:'Auditable entity', fields:[
     {k:'name',l:'Entity (system, process or location)',req:1},{k:'category',l:'Category',t:'select',o:['Application','Infrastructure','Process','Vendor','Location','Project']},
@@ -67,7 +68,7 @@ const SCHEMAS = {
     {k:'result',l:'Conclusion',t:'select',o:['Not concluded','Effective','Partially effective','Ineffective']},
     {k:'notes',l:'Workpaper notes / results of testing',t:'area',w:1}]},
   evidence:{label:'Evidence request', fields:[
-    {k:'title',l:'Evidence / request',req:1},{k:'workpaper_id',l:'Supports workpaper',t:'ref',ref:'workpapers'},
+    {k:'title',l:'Evidence / request',req:1},{k:'workpaper_id',l:'Supports workpaper',t:'ref',ref:'workpapers'},{k:'purpose',l:'Purpose in the test',t:'select',o:PURPOSES},
     {k:'type',l:'Type',t:'select',o:['System report / extract','Screenshot','Configuration export','Policy / procedure','Ticket / approval','Email','Interview notes','Log file','Other']},
     {k:'pbc_status',l:'Request (PBC) status',t:'select',o:['Requested','Received','Accepted','Rejected - resubmit']},
     {k:'requested_from',l:'Requested from'},{k:'requested_on',l:'Requested on',t:'date'},
@@ -123,7 +124,7 @@ async function api(method, path, body, file){
 const TABLES = ['universe','plan','engagements','risks','workpapers','evidence','files','review_notes','issues','time_entries'];
 
 /* ---------- State & helpers ---------- */
-const S = {me:null, users:[], sec:'home', tab:'overview', eng:null, wp:null, year:String(new Date().getFullYear()), filt:{}};
+const S = {att:{purpose:PURPOSES[0], desc:''}, busy:0, me:null, users:[], sec:'home', tab:'overview', eng:null, wp:null, year:String(new Date().getFullYear()), filt:{}};
 TABLES.forEach(t => S[t] = []);
 const $ = sel => document.querySelector(sel);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -397,7 +398,8 @@ const EV = {
     return `<div class="card"><div class="toolbar"><h2>Workpapers</h2><button class="btn ghost" id="libBtn">Add from ITGC library</button><button class="btn" data-new="workpapers">New workpaper</button></div>
       ${table([['Ref', w => `<b style="white-space:nowrap">${esc(w.ref)}</b>`], ['Control', w => esc(w.title) + (w.key_control === 'Yes' ? ' <span class="badge">Key</span>' : '')],
         ['Assigned', w => esc(uname(w.assigned_to))], ['Sample', w => esc(w.sample_size) + (+w.exceptions > 0 ? ` <span class="over">(${esc(w.exceptions)} exc.)</span>` : '')],
-        ['Evidence', w => inEng('evidence').filter(x => x.workpaper_id === w.id).length], ['Notes', w => { const n = openNotes(w.id).length; return n ? `<span class="over">${n} open</span>` : ''; }],
+        ['Evidence', w => { const n = wpFiles(w.id).length;
+          return `<span style="white-space:nowrap">${n ? `&#128206; ${n}` : '<span class="muted">none</span>'} <label class="link attach" title="Attach files to this test">Attach<input type="file" multiple hidden data-attach="${w.id}"></label></span>`; }], ['Notes', w => { const n = openNotes(w.id).length; return n ? `<span class="over">${n} open</span>` : ''; }],
         ['Due', w => due(w.due_date, w.status)], ['Status', w => badge(w.status)], ['Conclusion', w => resultBadge(w.result)],
         ['Prepared', w => so(w.prepared_by, w.prepared_at)], ['Reviewed', w => so(w.reviewed_by, w.reviewed_at)]], W, {open:'wp'})}</div>`;
   },
@@ -459,7 +461,7 @@ const EV = {
 const canEditEng = e => isMgmt() || e.lead_id === S.me.id;
 
 function evidenceTable(E){
-  return table([['Evidence', x => `<b>${esc(x.title)}</b><div class="muted">${esc(x.type)}</div>`],
+  return table([['Evidence', x => `<b>${esc(x.title)}</b><div class="muted">${esc([x.purpose, x.type].filter(Boolean).join(' · '))}</div>`],
     ['Workpaper', x => { const w = byId('workpapers', x.workpaper_id); return w ? esc(w.ref) : '<span class="muted">unlinked</span>'; }],
     ['Request', x => badge(x.pbc_status) + `<div class="muted">${esc(x.requested_from)}${x.requested_on ? ' &middot; ' + esc(x.requested_on) : ''}</div>`],
     ['Received', x => esc(x.collected_on) + (x.collected_by ? `<div class="muted">by ${esc(x.collected_by)}</div>` : '')],
@@ -491,15 +493,76 @@ function wpView(e){
     <div class="card"><h2>Control &amp; test</h2>${kv([['Risk area', (byId('risks', w.risk_id) || {}).area], ['Framework reference', w.framework_ref], ['Control description', w.control_desc],
       ['Nature / frequency', [w.nature, w.frequency, w.key_control === 'Yes' && 'Key control'].filter(Boolean).join(' · ')], ['Test method', w.test_type], ['Procedure', w.procedure],
       ['Population', w.population], ['Sample size', w.sample_size], ['Exceptions', w.exceptions], ['Assigned to', uname(w.assigned_to)], ['Due', w.due_date], ['Results / notes', w.notes]])}</div>
+    ${testEvidence(w)}
     <div class="card"><div class="toolbar"><h2>Review notes</h2><button class="btn" data-addnote="${w.id}">Add review note</button></div>
       ${N.length ? N.map(n => `<div class="note ${n.status}"><div>${badge(n.status)} <b>${esc(uname(n.created_by))}</b> <span class="muted">${esc(fmtTs(n.created_at))}</span></div>
         <p style="white-space:pre-wrap;margin:6px 0">${esc(n.note)}</p>
         ${n.response ? `<div class="muted">Response from ${esc(uname(n.responded_by))} (${esc(fmtTs(n.responded_at))}):</div><p style="white-space:pre-wrap;margin:4px 0">${esc(n.response)}</p>` : ''}
         <div>${n.status !== 'Cleared' ? `<button class="link" data-respond="${n.id}">Respond</button>` : ''}
         ${isMgmt() || n.created_by === me ? (n.status === 'Cleared' ? `<button class="link" data-noteact="reopen" data-id="${n.id}">Reopen</button>` : `<button class="link" data-noteact="clear" data-id="${n.id}">Clear</button>`) : ''}</div></div>`).join('') : '<div class="empty">No review notes.</div>'}</div>
-    <div class="card"><div class="toolbar"><h2>Evidence</h2><button class="btn" data-addev="${w.id}">Add evidence</button></div>${evidenceTable(inEng('evidence').filter(x => x.workpaper_id === w.id))}</div>
     <div class="card"><h2>Issues raised</h2>${issueTable(inEng('issues').filter(i => i.workpaper_id === w.id))}</div>
     <div class="card"><div class="toolbar"><h2>History</h2><button class="btn ghost" data-loadlog="rec:${w.id}">Show history</button></div><div id="logBox"></div></div>`;
+}
+
+const MAX_MB = 50;
+const wpFiles = wpId => S.files.filter(f => (byId('evidence', f.evidence_id) || {}).workpaper_id === wpId);
+
+// Evidence panel shown inside a test: drop zone plus every file supporting it.
+function testEvidence(w){
+  const E = inEng('evidence').filter(x => x.workpaper_id === w.id);
+  const rows = E.flatMap(x => { const F = S.files.filter(f => f.evidence_id === x.id); return F.length ? F.map(f => ({id:f.id, x, f})) : [{id:x.id, x}]; });
+  const n = wpFiles(w.id).length, signed = w.prepared_by || w.reviewed_by;
+  return `<div class="card" data-drop="${w.id}"><div class="toolbar"><h2>Test evidence &middot; ${n} file${n === 1 ? '' : 's'}</h2>
+      <button class="btn ghost" data-addev="${w.id}" title="Track a request for evidence you have not received yet">New PBC request</button></div>
+    <div class="fields">
+      <div><label for="att_purpose">What is this file?</label><select id="att_purpose">${PURPOSES.map(p => `<option${p === S.att.purpose ? ' selected' : ''}>${esc(p)}</option>`).join('')}</select></div>
+      <div><label for="att_desc">Description (optional)</label><input id="att_desc" value="${esc(S.att.desc)}" placeholder="e.g. AD user extraction as at 30 Sep 2026, 1,204 accounts"></div></div>
+    <div class="dropzone"><div><b>Drag &amp; drop files here</b> or <label class="btn attach">Choose files<input type="file" multiple hidden data-attach="${w.id}"></label></div>
+      <div class="muted" style="margin-top:6px">Up to ${MAX_MB} MB per file. Each file is fingerprinted (SHA-256) and the upload is logged.</div>
+      ${signed ? '<div class="over" style="margin-top:6px">This test is signed off. Attaching or removing evidence removes the sign-offs so it can be re-reviewed.</div>' : ''}
+      <div id="upProg"></div></div>
+    ${rows.length ? table([
+      ['File', r => r.f ? `<button class="link" data-file="${r.f.id}" data-name="${esc(r.f.name)}">${esc(r.f.name)}</button><div class="muted">${fmtSize(r.f.size)}</div>`
+        : `${badge(r.x.pbc_status || 'No file')} <label class="link attach">Upload<input type="file" multiple hidden data-upload="${r.x.id}"></label>`],
+      ['Purpose', r => r.x.purpose ? badge(r.x.purpose) : ''],
+      ['Description', r => (!r.f || r.x.title !== r.f.name ? `<b>${esc(r.x.title)}</b>` : '') + (r.x.notes ? `<div class="muted">${esc(r.x.notes)}</div>` : '')],
+      ['Uploaded', r => r.f ? `${esc(uname(r.f.created_by))}<div class="muted">${esc(fmtTs(r.f.created_at))}</div>` : `<span class="muted">${esc(r.x.requested_from || '')}</span>`],
+      ['SHA-256', r => r.f ? `<span class="mono muted" title="${esc(r.f.sha256)}">${esc(r.f.sha256.slice(0, 16))}&hellip;</span>` : '']], rows,
+      {actions:r => `<button class="link" data-edit="evidence" data-id="${r.x.id}">Edit</button>` +
+        (r.f ? (isMgmt() || r.f.created_by === S.me.id ? `<button class="link" data-delfile="${r.f.id}">Remove</button>` : '') : `<button class="link" data-del="evidence" data-id="${r.x.id}">Delete</button>`)})
+    : '<div class="empty">No evidence attached yet. Attach the extraction you tested, your sample selection and your test results here.</div>'}</div>`;
+}
+
+// Upload with progress (XHR, because fetch has no upload progress).
+function upload(path, file, extra, onProgress){
+  return new Promise((res, rej) => {
+    const x = new XMLHttpRequest(); x.open('POST', '/api/' + path);
+    x.setRequestHeader('X-Requested-With', 'fetch'); x.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    x.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+    for (const [k, v] of Object.entries(extra || {})) if (v) x.setRequestHeader(k, encodeURIComponent(v));
+    x.upload.onprogress = e => onProgress && e.lengthComputable && onProgress(e.loaded / e.total);
+    x.onload = () => { let d = {}; try { d = JSON.parse(x.responseText); } catch {} x.status < 300 ? res(d) : rej(new Error(d.error || `Upload failed (${x.status})`)); };
+    x.onerror = () => rej(new Error(`Upload of ${file.name} failed. Check your connection and the ${MAX_MB} MB limit.`));
+    x.send(file);
+  });
+}
+async function attachFiles(wpId, files){
+  if (!files.length) return;
+  const bad = files.find(f => !f.size || f.size > MAX_MB * 1048576);
+  if (bad) throw new Error(`${bad.name} ${bad.size ? `is larger than ${MAX_MB} MB` : 'is empty'}.`);
+  const w = byId('workpapers', wpId);
+  if (w && (w.prepared_by || w.reviewed_by) && !confirm('This test is signed off. Attaching evidence removes the sign-offs so it can be re-reviewed. Continue?')) return;
+  S.busy++;
+  try {
+    for (const [i, f] of files.entries()){
+      await upload(`workpapers/${wpId}/attach`, f, {'X-Purpose':S.att.purpose, 'X-Description':S.att.desc}, p => {
+        const el = $('#upProg'); if (el) el.innerHTML = `<div class="muted">Uploading ${esc(f.name)} (${i + 1} of ${files.length})</div><div class="bar"><span style="width:${Math.round(p * 100)}%;background:var(--accent)"></span></div>`;
+      });
+    }
+  } finally { S.busy--; }
+  S.att.desc = '';
+  toast(`${files.length} file${files.length > 1 ? 's' : ''} attached to ${w ? w.ref : 'the test'}`);
+  await refresh();
 }
 
 /* ---------- Layout ---------- */
@@ -549,6 +612,7 @@ function passwordDialog(forced){
 
 /* ---------- Events ---------- */
 document.addEventListener('click', e => {
+  if (e.target.closest('label.attach, input[type=file]')) return;  // let file pickers open without opening the row
   const el = e.target.closest('button, tr.click, [data-close]'); if (!el) return;
   const d = el.dataset;
   if ('close' in d) return dlg.close();
@@ -612,12 +676,26 @@ document.addEventListener('change', e => {
   if (t.id === 'engSel'){ if (t.value){ S.eng = t.value; S.sec = 'eng'; S.tab = 'overview'; S.wp = null; } render(); }
   else if (t.id === 'yearSel'){ S.year = t.value === '__next' ? String(Math.max(...[...t.options].map(o => +o.value || 0)) + 1) : t.value; render(); }
   else if (t.dataset.filt !== undefined){ S.filt[t.dataset.filt] = t.value; render(); }
+  else if (t.id === 'att_purpose') S.att.purpose = t.value;
+  else if (t.dataset.attach){ const files = [...t.files]; t.value = ''; run(() => attachFiles(t.dataset.attach, files)); }
   else if (t.dataset.upload) run(async () => {
-    for (const f of t.files) await api('POST', `evidence/${t.dataset.upload}/files`, undefined, f);
+    const files = [...t.files]; t.value = '';
+    const bad = files.find(f => !f.size || f.size > MAX_MB * 1048576);
+    if (bad) throw new Error(`${bad.name} ${bad.size ? `is larger than ${MAX_MB} MB` : 'is empty'}.`);
+    for (const f of files) await upload(`evidence/${t.dataset.upload}/files`, f);
     toast('Uploaded'); await refresh();
   });
 });
-window.addEventListener('focus', () => { if (S.me && !dlg.open) run(refresh); });
+document.addEventListener('input', e => { if (e.target.id === 'att_desc') S.att.desc = e.target.value; });
+window.addEventListener('focus', () => { if (S.me && !dlg.open && !S.busy) run(refresh); });
+// Drag & drop onto a test's evidence panel; ignore drops elsewhere so the browser doesn't navigate away.
+const dropZone = e => e.target.closest && e.target.closest('[data-drop]');
+document.addEventListener('dragover', e => { e.preventDefault(); const z = dropZone(e); if (z) z.classList.add('over-drop'); });
+document.addEventListener('dragleave', e => { const z = dropZone(e); if (z && !z.contains(e.relatedTarget)) z.classList.remove('over-drop'); });
+document.addEventListener('drop', e => {
+  e.preventDefault(); const z = dropZone(e); if (!z) return;
+  z.classList.remove('over-drop'); run(() => attachFiles(z.dataset.drop, [...e.dataTransfer.files]));
+});
 
 function defaultsFor(t){
   return {workpapers:{status:'Not started', result:'Not concluded'}, evidence:{pbc_status:'Requested', requested_on:today()}, issues:{status:'Open'},
