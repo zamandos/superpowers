@@ -73,6 +73,36 @@ A few rules keep OCR honest as evidence:
 
 Page previews are rendered on the server as images, so no PDF content runs in the browser. Password-protected PDFs are reported as such, so you can ask the auditee for an unprotected copy. Evidence search covers PDF text and shows the page number of each match.
 
+**Testing tools.** Every test has a *Testing tools* panel with three tools that do the mechanical part of common IT audit tests. Each one keeps a trail a reviewer or external auditor can re-perform. They read CSV and Excel (.xlsx) extractions, including multi-sheet workbooks and Excel date cells.
+
+1. **Reproducible random sampling.**
+   - **Draw:** pick the population extraction attached to the test, set the sample size (suggested from the control frequency), and draw. The sample is saved to the test as a CSV evidence file holding the original rows and their population row numbers.
+   - **Recorded:** the seed, the population file's SHA-256 fingerprint and row count, and the selected rows.
+   - **Method:** each row *n* is ranked by SHA-256 of `"<seed>:<n>"` and the lowest are selected. This is documented on the evidence, so anyone can re-perform it, even outside this app.
+   - **Re-perform:** checks that the population file is unchanged and that the same rows come out again. If the population file was altered, this fails.
+2. **Access test: leavers and dormant accounts.**
+   - **Inputs:** an account extraction (e.g. `Get-ADUser` output) and the HR leavers report, with the extraction date, leaver SLA and dormancy threshold. Columns are mapped automatically from common header names, and you can change them.
+   - **Flags:**
+     - leavers still enabled after the SLA
+     - logons after termination
+     - accounts disabled late (if a disabled-date column is available)
+     - dormant enabled accounts
+     - generic or shared account names
+   - **Report:** leavers that can't be matched to an account are listed to check manually.
+   - **Formats handled:**
+     - account names in the forms `CORP\jsmith`, `jsmith@corp.com` and `JSmith`
+     - PowerShell US-style dates, ISO dates, Excel dates and AD timestamps
+     - `userAccountControl` values
+   - **Ambiguous dates:** if dates like 03/04/2026 could be day-first or month-first, it asks instead of guessing.
+   - **Output:** the exceptions are saved to the test as a CSV, together with the inputs' fingerprints. **Raise issue** drafts the finding.
+3. **Policy vs actual settings.**
+   - **Suggest from policy:** finds requirements in the engagement's policy documents and proposes checks. For example, "Passwords must be a minimum of 12 characters" becomes *Minimum password length at least 12*, quoting the policy file, page and sentence.
+   - **Run checks:** reads the actual values from the test's screenshots and documents and marks each check **Pass**, **Exception** or **Not found**. Each result shows the source file and the exact line read.
+   - **Raise issue:** creates the finding with the criteria and condition already filled in.
+   - **Built-in settings:** password length, history, age, complexity, reversible encryption, and lockout threshold and duration. You can add checks for any other setting by hand.
+
+Running a tool on a signed-off test removes the sign-offs, the same as adding evidence. Sample and analysis records can't be edited after the fact, and every run is in the audit trail.
+
 **Evidence and PBC requests.** Track each request as requested, received, accepted, or rejected and to be resubmitted. Attach files of up to 50 MB each. Each file is stored with a **SHA-256 fingerprint**, and every upload, download and removal is logged.
 
 **Issues.** Findings are written as condition, criteria, cause, effect and recommendation, with a management owner, due date, status and response. **Criticality = likelihood × impact**:

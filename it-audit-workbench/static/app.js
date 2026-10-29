@@ -87,6 +87,14 @@ const SCHEMAS = {
   time_entries:{label:'Time entry', fields:[
     {k:'date',l:'Date',t:'date',req:1},{k:'hours',l:'Hours',t:'number',req:1},{k:'user_id',l:'Staff',t:'user',mgmt:1},
     {k:'activity',l:'Activity',t:'select',o:['Planning','Fieldwork','Review','Reporting','Follow-up','Admin']},{k:'notes',l:'Notes',t:'area',w:1}]},
+  setting_checks:{label:'Setting check', fields:[
+    {k:'label',l:'Setting',req:1,list:['Minimum password length','Enforce password history','Maximum password age','Minimum password age',
+      'Account lockout threshold','Account lockout duration','Password must meet complexity requirements','Store passwords using reversible encryption']},
+    {k:'match_text',l:'Text to look for in the evidence',hint:'As the setting is labelled on screen. Leave blank to use the setting name.'},
+    {k:'operator',l:'Requirement',t:'select',req:1,o:[['>=','at least (≥)'],['<=','at most (≤)'],['=','equal to'],['!=','not equal to']]},
+    {k:'expected',l:'Required value',req:1,hint:'e.g. 12, or Enabled'},{k:'unit',l:'Unit',hint:'e.g. characters, days'},
+    {k:'file_id',l:'Read the actual value from',t:'wpfile',hint:'Leave blank to search all screenshots and documents on this test'},
+    {k:'policy_ref',l:'Policy reference',t:'area',w:1,hint:'Where the requirement comes from, e.g. IS-04 section 3.1'}]},
   users:{label:'User', fields:[
     {k:'username',l:'Username',req:1,newOnly:1},{k:'name',l:'Full name',req:1},{k:'email',l:'Email',t:'email'},
     {k:'role',l:'Role',t:'select',req:1,o:[['admin','Administrator'],['manager','Audit manager (reviewer)'],['auditor','Auditor'],['auditee','Auditee (issue owner)']]},
@@ -121,7 +129,8 @@ async function api(method, path, body, file){
   if (!r.ok) throw new Error(data.error || r.statusText);
   return data;
 }
-const TABLES = ['universe','plan','engagements','risks','workpapers','evidence','files','review_notes','issues','time_entries'];
+const TABLES = ['universe','plan','engagements','risks','workpapers','evidence','files','review_notes','issues','time_entries',
+  'samples','analyses','setting_checks'];
 
 /* ---------- State & helpers ---------- */
 const S = {att:{purpose:PURPOSES[0], desc:''}, busy:0, me:null, users:[], sec:'home', tab:'overview', eng:null, wp:null, year:String(new Date().getFullYear()), filt:{}};
@@ -163,6 +172,7 @@ async function refresh(){ await loadAll(); render(); }
 const dlg = $('#dlg');
 function optionList(f, v){
   if (f.t === 'select'){ const o = f.o.map(o => Array.isArray(o) ? o : [o, o]); return v && !o.some(x => x[0] === String(v)) ? [[v, v], ...o] : o; }
+  if (f.t === 'wpfile') return S.files.filter(x => x.ocr_status === 'done' && (byId('evidence', x.evidence_id) || {}).workpaper_id === S.wp).map(x => [x.id, x.name]);
   if (f.t === 'user') return S.users.filter(u => u.active && (f.all || u.role !== 'auditee')).map(u => [u.id, u.name + (u.role === 'auditee' ? ' (auditee)' : '')]);
   const rows = f.ref === 'universe' ? S.universe : inEng(f.ref);
   return rows.map(r => [r.id, f.ref === 'workpapers' ? `${r.ref} - ${r.title}` : r.area || r.name]);
@@ -171,7 +181,7 @@ function fieldHtml(f, v, isNew){
   if ((f.newOnly && !isNew) || (f.editOnly && isNew) || (f.mgmt && !isMgmt())) return '';
   const id = 'f_' + f.k, req = f.req && !(f.t === 'password' && !isNew) ? ' required' : '';
   let inp;
-  if (['select','user','ref'].includes(f.t)){
+  if (['select','user','ref','wpfile'].includes(f.t)){
     inp = `<select id="${id}" name="${f.k}"${req}><option value=""></option>${optionList(f, v).map(([val, lab]) =>
       `<option value="${esc(val)}"${String(v ?? '') === String(val) ? ' selected' : ''}>${esc(lab)}</option>`).join('')}</select>`;
   } else if (f.t === 'area'){
@@ -187,7 +197,7 @@ function fieldHtml(f, v, isNew){
 function modal(title, inner, onSubmit, opts = {}){
   dlg.classList.remove('wide');
   dlg.innerHTML = `<form><h3>${esc(title)}</h3>${inner}<div id="calc" class="muted" style="margin-top:8px"></div>
-    <div class="dlgbar">${opts.noCancel ? '' : '<button type="button" class="btn ghost" data-close>Cancel</button>'}<button class="btn" id="saveBtn">${esc(opts.ok || 'Save')}</button></div></form>`;
+    <div class="dlgbar">${opts.noCancel || opts.info ? '' : '<button type="button" class="btn ghost" data-close>Cancel</button>'}<button class="btn" id="saveBtn">${esc(opts.ok || 'Save')}</button></div></form>`;
   const form = dlg.querySelector('form');
   form.onsubmit = async e => {
     e.preventDefault();
@@ -498,6 +508,7 @@ function wpView(e){
       ['Nature / frequency', [w.nature, w.frequency, w.key_control === 'Yes' && 'Key control'].filter(Boolean).join(' · ')], ['Test method', w.test_type], ['Procedure', w.procedure],
       ['Population', w.population], ['Sample size', w.sample_size], ['Exceptions', w.exceptions], ['Assigned to', uname(w.assigned_to)], ['Due', w.due_date], ['Results / notes', w.notes]])}</div>
     ${testEvidence(w)}
+    ${testingTools(w)}
     <div class="card"><div class="toolbar"><h2>Review notes</h2><button class="btn" data-addnote="${w.id}">Add review note</button></div>
       ${N.length ? N.map(n => `<div class="note ${n.status}"><div>${badge(n.status)} <b>${esc(uname(n.created_by))}</b> <span class="muted">${esc(fmtTs(n.created_at))}</span></div>
         <p style="white-space:pre-wrap;margin:6px 0">${esc(n.note)}</p>
@@ -713,6 +724,169 @@ function ocrAdminCard(){
     <p class="muted">Evidence is read on this server; nothing is sent outside your network. Restart Audit Workbench after installing a tool.</p></div>`;
 }
 
+/* ---------- Testing tools ---------- */
+const OP_WORDS = {'>=':'at least', '<=':'at most', '=':'equal to', '!=':'not equal to'};
+const RESULT_CLS = {'Pass':'b-Low', 'Exception':'b-Critical', 'Not found':'b-Medium'};
+const isTabular = f => !f.kind && /\.(csv|tsv|txt|xlsx)$/i.test(f.name);
+const wpTabular = wpId => wpFiles(wpId).filter(isTabular);
+const shortHash = h => h ? `<span class="mono" title="SHA-256 ${esc(h)}">${esc(h.slice(0, 12))}&hellip;</span>` : '';
+const J = v => { try { return JSON.parse(v || 'null'); } catch { return null; } };
+
+function testingTools(w){
+  const samples = S.samples.filter(x => x.workpaper_id === w.id).sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const runs = S.analyses.filter(x => x.workpaper_id === w.id).sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const checks = S.setting_checks.filter(x => x.workpaper_id === w.id);
+  const fileLink = id => { const f = byId('files', id); return f ? `<button class="link" data-file="${f.id}" data-name="${esc(f.name)}">${esc(f.name)}</button>` : ''; };
+  const req = r => `${OP_WORDS[r.operator] || r.operator} <b>${esc(r.expected)}</b>${r.unit ? ' ' + esc(r.unit) : ''}`;
+  return `<div class="card"><h2>Testing tools</h2>
+    <section class="tool"><div class="toolbar"><h3>Random sample selection</h3><button class="btn" data-sample="${w.id}">Draw random sample</button></div>
+      <p class="muted">Draws a reproducible random sample from a population extraction attached to this test. The seed and the population's fingerprint are recorded so anyone can re-perform the selection.</p>
+      ${samples.length ? table([['Drawn', x => `${esc(uname(x.created_by))}<div class="muted">${esc(fmtTs(x.created_at))}</div>`],
+        ['Population', x => `${esc(x.population_name)}${x.sheet ? ` <span class="muted">(${esc(x.sheet)})</span>` : ''}<div class="muted">${esc(x.population_rows)} rows &middot; ${shortHash(x.population_sha256)}</div>`],
+        ['Sample', x => `<b>${esc(x.size)}</b> items<div class="muted">seed ${esc(x.seed)}</div>`], ['Sample file', x => fileLink(x.sample_file_id)],
+        ['Re-performance', x => x.verify_result ? `${badge(x.verify_result.startsWith('Verified') ? 'Verified' : 'Failed', x.verify_result.startsWith('Verified') ? 'b-Low' : 'b-Critical')}<div class="muted">${esc(uname(x.verified_by))}, ${esc(fmtTs(x.verified_at))}</div>` : '<span class="muted">not yet</span>']],
+        samples, {actions:x => `<button class="link" data-verify="${x.id}">Re-perform</button>`}) : ''}</section>
+    <section class="tool"><div class="toolbar"><h3>Access test: leavers &amp; dormant accounts</h3><button class="btn" data-access="${w.id}">Run access test</button></div>
+      <p class="muted">Compares an account extraction (e.g. Active Directory) with the HR leavers report. It flags leavers still enabled, logons after termination, late disabling, dormant accounts and generic or shared accounts.</p>
+      ${runs.length ? table([['Run', x => `${esc(uname(x.created_by))}<div class="muted">${esc(fmtTs(x.created_at))}</div>`],
+        ['Inputs', x => (J(x.inputs) || []).map(i => `<div>${esc(i.role)}: ${esc(i.name)} <span class="muted">(${i.rows} rows)</span></div>`).join('')],
+        ['As at', x => esc((J(x.summary) || {}).as_at)],
+        ['Results', x => Object.entries(J(x.counts) || {}).filter(([, v]) => v).map(([k, v]) => `<div><b class="over">${v}</b> ${esc(k.toLowerCase())}</div>`).join('') || badge('No exceptions', 'b-Low')],
+        ['Exceptions file', x => fileLink(x.result_file_id)]], runs,
+        {actions:x => `<button class="link" data-analysis="${x.id}">View results</button>`}) : ''}</section>
+    <section class="tool"><div class="toolbar"><h3>Policy vs actual settings</h3>
+        <button class="btn ghost" data-suggest="${w.id}">Suggest from policy</button><button class="btn ghost" data-addcheck="${w.id}">Add check</button>
+        <button class="btn" data-runchecks="${w.id}"${checks.length ? '' : ' disabled'}>Run checks</button></div>
+      <p class="muted">Reads required values from policy documents in this engagement and compares them with the settings shown in this test's screenshots and documents. Each result shows the exact line it was read from.</p>
+      ${checks.length ? table([['Setting', r => `<b>${esc(r.label)}</b>${r.match_text && r.match_text !== r.label ? `<div class="muted">looks for &ldquo;${esc(r.match_text)}&rdquo;</div>` : ''}`],
+        ['Required', r => req(r) + (r.policy_ref ? `<div class="muted clamp" title="${esc(r.policy_ref)}">${esc(r.policy_ref)}</div>` : '')],
+        ['Actual', r => r.check_actual != null ? `<b>${esc(r.check_actual)}</b>${r.unit ? ' ' + esc(r.unit) : ''}${r.check_source_file_id ? `<div class="muted">${fileLink(r.check_source_file_id)}</div><div class="mono muted">${esc(r.check_source_line)}</div>` : ''}` : ''],
+        ['Result', r => r.check_result ? badge(r.check_result, RESULT_CLS[r.check_result]) + (r.check_note ? `<div class="muted" style="max-width:220px">${esc(r.check_note)}</div>` : '') : '<span class="muted">not run</span>']],
+        checks, {actions:r => (r.check_result === 'Exception' ? `<button class="link" data-raisecheck="${r.id}">Raise issue</button>` : '') + editDel('setting_checks', r)})
+        : '<div class="empty">No checks yet. Attach the policy (PDF) and the settings screenshot, then use <b>Suggest from policy</b>.</div>'}</section></div>`;
+}
+
+async function preview(fid, sheet){ return api('GET', `files/${fid}/table${sheet ? '?sheet=' + encodeURIComponent(sheet) : ''}`); }
+const previewTable = p => `<div class="muted" style="margin:6px 0">${p.row_count.toLocaleString()} data rows${p.sheet ? ` in sheet &ldquo;${esc(p.sheet)}&rdquo;` : ''}. First rows:</div>
+  <div class="tablewrap preview"><table><tr>${p.headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr>${p.rows.slice(0, 4).map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</table></div>`;
+const fileOptions = (files, sel) => files.map(f => `<option value="${f.id}"${f.id === sel ? ' selected' : ''}>${esc(f.name)}</option>`).join('');
+const needTabular = w => { toast(`Attach the extraction to ${w.ref} first (CSV or .xlsx), using the Test evidence panel.`, true); };
+
+function sampleDialog(w){
+  const files = wpTabular(w.id);
+  if (!files.length) return needTabular(w);
+  const pick = files.find(f => /population/i.test((byId('evidence', f.evidence_id) || {}).purpose || '')) || files[0];
+  const form = modal(`Draw a random sample for ${w.ref}`, `<div class="fields">
+      <div><label for="sp_file">Population file</label><select id="sp_file" name="file_id">${fileOptions(files, pick.id)}</select></div>
+      <div><label for="sp_sheet">Sheet</label><select id="sp_sheet" name="sheet" disabled></select></div>
+      <div class="wide" id="sp_prev"><span class="muted">Reading file&hellip;</span></div>
+      <div><label for="sp_size">Sample size</label><input id="sp_size" name="size" type="number" min="1" required value="${esc(w.sample_size || suggestedSample(w.frequency, w.key_control === 'Yes') || '')}">
+        <div class="hint">${w.frequency ? `Guide for this control (${esc(w.frequency.toLowerCase())}): ${esc(String(suggestedSample(w.frequency, false)))}&ndash;${esc(String(suggestedSample(w.frequency, true)))}` : 'Set the control frequency on the test to get a suggestion.'}</div></div>
+      <div><label for="sp_seed">Seed (optional)</label><input id="sp_seed" name="seed" placeholder="leave blank to generate" pattern="[A-Za-z0-9_\\-]{1,40}">
+        <div class="hint">Recorded with the sample. The same seed and population always give the same selection.</div></div></div>`,
+    async f => {
+      const d = Object.fromEntries(new FormData(f));
+      const sm = await api('POST', `workpapers/${w.id}/sample`, {file_id:d.file_id, sheet:$('#sp_sheet').value || null, size:+d.size, seed:d.seed});
+      toast(`Sample of ${sm.size} drawn (seed ${sm.seed}) and attached to ${w.ref}`); await refresh();
+    }, {ok:'Draw sample'});
+  const load = async sheet => {
+    try {
+      const p = await preview($('#sp_file').value, sheet);
+      const sh = $('#sp_sheet'); sh.disabled = !p.sheets; sh.innerHTML = (p.sheets || []).map(n => `<option${n === p.sheet ? ' selected' : ''}>${esc(n)}</option>`).join('');
+      $('#sp_prev').innerHTML = previewTable(p); $('#sp_size').max = p.row_count;
+    } catch (e) { $('#sp_prev').innerHTML = `<p class="over">${esc(e.message)}</p>`; }
+  };
+  form.querySelector('#sp_file').onchange = () => load(); form.querySelector('#sp_sheet').onchange = e => load(e.target.value); load();
+}
+function verifyDialog(v){
+  modal(v.verify_result === 'Verified' ? 'Sample re-performed: verified' : 'Sample re-performance failed', `
+    <p>${badge(v.verify_result.startsWith('Verified') ? 'Verified' : 'Failed', v.verify_result.startsWith('Verified') ? 'b-Low' : 'b-Critical')} Sample of ${esc(v.size)} from ${esc(v.population_name)}, seed ${esc(v.seed)}.</p>
+    ${table([['Check', c => esc(c[0])], ['Result', c => c[1] ? badge('OK', 'b-Low') : badge('Failed', 'b-Critical')], ['Detail', c => `<span class="mono">${esc(c[2])}</span>`]], v.checks.map((c, i) => Object.assign(c, {id:i})))}
+    <p class="muted" style="font-size:12px">Method: ${esc(v.method)}</p>`, async () => {}, {ok:'Close', info:true});
+}
+
+const ROLE_LABELS = {user_key:'Account name *', user_enabled:'Enabled / status', user_last_logon:'Last logon date', user_disabled_on:'Date disabled (optional)',
+  user_name:'Display name (optional)', leaver_key:'Account name / network ID *', leaver_term_date:'Termination date *'};
+function accessDialog(w){
+  const files = wpTabular(w.id);
+  if (files.length < 2) return toast(`Attach both the account extraction and the HR leavers report to ${w.ref} first (CSV or .xlsx).`, true);
+  const guessFile = re => (files.find(f => re.test(f.name)) || {}).id;
+  const uDef = guessFile(/ad|user|account|entra|iam/i) || files[0].id, lDef = guessFile(/leaver|hr|termin|starter/i) || files.find(f => f.id !== uDef).id;
+  const P = {};
+  const side = (k, label, def, roles) => `<fieldset class="side"><legend>${label}</legend>
+    <div class="fields"><div><label for="${k}_file">File</label><select id="${k}_file">${fileOptions(files, def)}</select></div>
+      <div><label for="${k}_sheet">Sheet</label><select id="${k}_sheet" disabled></select></div>
+      ${roles.map(r => `<div><label for="m_${r}">${ROLE_LABELS[r]}</label><select id="m_${r}" name="${r}"></select></div>`).join('')}
+      ${k === 'u' ? `<div><label for="m_enabled_means">The status column shows</label><select id="m_enabled_means" name="enabled_means"><option value="enabled">Enabled = True/Yes</option><option value="disabled">Disabled = True/Yes</option></select></div>` : ''}</div>
+    <div id="${k}_prev" class="muted">Reading file&hellip;</div></fieldset>`;
+  const form = modal(`Access test for ${w.ref}: leavers & dormant accounts`,
+    side('u', 'Account extraction', uDef, ['user_key', 'user_enabled', 'user_last_logon', 'user_disabled_on', 'user_name']) +
+    side('l', 'HR leavers report', lDef, ['leaver_key', 'leaver_term_date']) +
+    `<div class="fields" style="margin-top:12px">
+      <div><label for="t_asat">Extraction date (as at) *</label><input id="t_asat" name="as_at" type="date" required value="${today()}"><div class="hint">The date the account list was run.</div></div>
+      <div><label for="t_sla">Leaver SLA (days)</label><input id="t_sla" name="sla_days" type="number" min="0" value="1"><div class="hint">From your access policy.</div></div>
+      <div><label for="t_dorm">Dormant after (days)</label><input id="t_dorm" name="dormant_days" type="number" min="1" value="90"></div>
+      <div><label for="t_fmt">Date format in the files</label><select id="t_fmt" name="date_format"><option value="auto">Detect automatically</option>
+        <option>DD/MM/YYYY</option><option>MM/DD/YYYY</option><option>YYYY-MM-DD</option></select></div></div>`,
+    async f => {
+      const d = Object.fromEntries(new FormData(f)), mapping = {};
+      for (const r of Object.keys(ROLE_LABELS)) if (d[r]) mapping[r] = d[r];
+      mapping.enabled_means = d.enabled_means; mapping.date_format = d.date_format;
+      const a = await api('POST', `workpapers/${w.id}/access_test`, {users:{file_id:$('#u_file').value, sheet:$('#u_sheet').value || null},
+        leavers:{file_id:$('#l_file').value, sheet:$('#l_sheet').value || null}, mapping, as_at:d.as_at, sla_days:+d.sla_days, dormant_days:+d.dormant_days});
+      await refresh(); setTimeout(() => analysisDialog(byId('analyses', a.id)), 0);
+    }, {ok:'Run test'});
+  dlg.classList.add('wide');
+  const load = async (k, sheet) => {
+    try {
+      const p = P[k] = await preview($(`#${k}_file`).value, sheet);
+      const sh = $(`#${k}_sheet`); sh.disabled = !p.sheets; sh.innerHTML = (p.sheets || []).map(n => `<option${n === p.sheet ? ' selected' : ''}>${esc(n)}</option>`).join('');
+      for (const r of Object.keys(ROLE_LABELS).filter(r => r.startsWith(k === 'u' ? 'user' : 'leaver'))){
+        const required = ROLE_LABELS[r].endsWith('*');
+        $(`#m_${r}`).innerHTML = (required ? '' : '<option value="">(not in this file)</option>') + p.headers.map(h => `<option${h === p.guess[r] ? ' selected' : ''}>${esc(h)}</option>`).join('');
+      }
+      $(`#${k}_prev`).innerHTML = previewTable(p);
+    } catch (e) { $(`#${k}_prev`).innerHTML = `<p class="over">${esc(e.message)}</p>`; }
+  };
+  for (const k of ['u', 'l']){ form.querySelector(`#${k}_file`).onchange = () => load(k); form.querySelector(`#${k}_sheet`).onchange = e => load(k, e.target.value); load(k); }
+}
+function analysisDialog(a){
+  if (!a) return;
+  const sm = J(a.summary) || {}, counts = J(a.counts) || {}, exc = J(a.exceptions) || [], un = J(a.unmatched) || [], warn = J(a.warnings) || [];
+  const total = +a.exceptions_count;
+  dlg.classList.remove('wide');
+  modal('Access test results', `<p class="muted" style="margin-top:0">As at ${esc(sm.as_at)} &middot; SLA ${esc(sm.sla_days)} day(s) &middot; dormant after ${esc(sm.dormant_days)} days &middot; run by ${esc(uname(a.created_by))}, ${esc(fmtTs(a.created_at))}</p>
+    ${table([['Input', i => esc(i.role)], ['File', i => esc(i.name) + (i.sheet ? ` <span class="muted">(${esc(i.sheet)})</span>` : '')], ['Rows', i => i.rows], ['SHA-256', i => shortHash(i.sha256)]], (J(a.inputs) || []).map((i, n) => Object.assign(i, {id:n})))}
+    <div class="grid" style="margin:12px 0">${stat(sm.accounts, 'Accounts')}${stat(sm.leavers_due, 'Leavers due by the as-at date')}${stat(sm.leavers_matched, 'Leavers matched to an account')}${stat(total, 'Exceptions', 1)}</div>
+    <div class="legend" style="gap:8px;margin-bottom:8px">${Object.entries(counts).map(([k, v]) => `<span class="badge ${v ? 'b-Critical' : 'b-Low'}">${esc(k)}: ${v}</span>`).join('')}</div>
+    ${warn.length ? `<div class="over" style="font-size:13px">${warn.map(esc).join('<br>')}</div>` : ''}
+    ${exc.length ? `<label for="excFilter" class="muted" style="font-size:12px;font-weight:600">Show</label> <select id="excFilter" style="width:auto"><option value="">All exceptions (${exc.length})</option>
+      ${Object.entries(counts).filter(([, v]) => v).map(([k, v]) => `<option>${esc(k)}</option>`).join('')}</select><div id="excTable"></div>` : '<p>No exceptions found.</p>'}
+    ${un.length ? `<h3 style="font-size:14px">Leavers not found in the account list (${un.length})</h3><p class="muted" style="margin-top:0">The account may have been deleted, or the IDs differ between the two systems. Confirm manually.</p>
+      ${table([['Leaver', u => esc(u.leaver)], ['Terminated', u => esc(u.termination_date)], ['Leavers row', u => u.row]], un.map((u, i) => Object.assign(u, {id:i})))}` : ''}
+    <div class="toolbar" style="margin-top:12px">${total ? `<button type="button" class="btn ghost" data-raiseaccess="${a.id}">Raise issue</button>` : ''}
+      <button type="button" class="btn ghost" data-file="${a.result_file_id}" data-name="${esc((byId('files', a.result_file_id) || {}).name || 'exceptions.csv')}">Download exceptions (CSV)</button></div>`,
+    async () => {}, {ok:'Close', info:true});
+  dlg.classList.add('wide');
+  const draw = filter => { const box = $('#excTable'); if (!box) return;
+    box.innerHTML = table([['Check', e => esc(e.check)], ['Account', e => `<b>${esc(e.account)}</b><div class="muted">${esc(e.name)}</div>`],
+      ['Terminated', e => esc(e.termination_date)], ['Enabled', e => esc(e.enabled)], ['Last logon', e => esc(e.last_logon)], ['Detail', e => esc(e.detail)]],
+      exc.filter(e => !filter || e.check === filter).map((e, i) => Object.assign(e, {id:i}))); };
+  $('#excFilter')?.addEventListener('change', e => draw(e.target.value)); draw('');
+}
+async function suggestDialog(w){
+  const props = await api('POST', `workpapers/${w.id}/setting_checks/suggest`, {});
+  if (!props.length) return toast('No new requirements found. Attach the policy as a PDF to this engagement (text is read automatically), or add checks manually.', true);
+  modal('Requirements found in policy documents', `<p class="muted" style="margin-top:0">Pick the requirements to check against this test's screenshots and documents. You can edit them afterwards.</p>
+    ${table([['Setting', p => `<label><input type="checkbox" name="p" value="${p.i}" checked style="width:auto"> <b>${esc(p.label)}</b></label>`],
+      ['Required', p => `${OP_WORDS[p.operator]} <b>${esc(p.expected)}</b> ${esc(p.unit || '')}`], ['From', p => `<span class="muted">${esc(p.policy_ref)}</span>`]],
+      props.map((p, i) => Object.assign(p, {id:i, i})))}`,
+    async f => {
+      for (const i of new FormData(f).getAll('p')) await api('POST', 'setting_checks', {...props[i], id:undefined, i:undefined, engagement_id:w.engagement_id, workpaper_id:w.id});
+      toast('Checks added. Press Run checks to compare them with the evidence.'); await refresh();
+    }, {ok:'Add selected'});
+}
+
 /* ---------- Layout ---------- */
 function render(){
   const app = $('#app');
@@ -821,6 +995,26 @@ document.addEventListener('click', e => {
   if (d.csv) return exportCsv(d.csv);
   if (d.loadlog) return run(() => loadLog(d.loadlog));
   if (d.ocr) return openOcr(d.ocr);
+  if (d.sample) return sampleDialog(byId('workpapers', d.sample));
+  if (d.verify) return run(async () => { const v = await api('POST', `samples/${d.verify}/verify`, {}); await refresh(); verifyDialog(v); });
+  if (d.access) return accessDialog(byId('workpapers', d.access));
+  if (d.analysis) return analysisDialog(byId('analyses', d.analysis));
+  if (d.suggest) return run(() => suggestDialog(byId('workpapers', d.suggest)));
+  if (d.runchecks) return run(async () => {
+    const rows = await api('POST', `workpapers/${d.runchecks}/setting_checks/run`, {});
+    const n = k => rows.filter(r => r.check_result === k).length;
+    toast(`${n('Pass')} pass, ${n('Exception')} exception${n('Exception') === 1 ? '' : 's'}, ${n('Not found')} not found`); await refresh();
+  });
+  if (d.addcheck) return openForm('setting_checks', null, {workpaper_id:d.addcheck, operator:'>='});
+  if (d.raisecheck){ const r = byId('setting_checks', d.raisecheck), src = byId('files', r.check_source_file_id) || {};
+    return openForm('issues', null, {workpaper_id:r.workpaper_id, status:'Open', title:`${r.label} does not meet policy`,
+      condition:`${r.label} is set to ${r.check_actual}${r.unit ? ' ' + r.unit : ''} (source: ${src.name || 'evidence'}: "${r.check_source_line || ''}").`,
+      criteria:`Requirement: ${r.label} ${OP_WORDS[r.operator]} ${r.expected}${r.unit ? ' ' + r.unit : ''}.${r.policy_ref ? ' ' + r.policy_ref : ''}`}); }
+  if (d.raiseaccess){ const a = byId('analyses', d.raiseaccess), c = JSON.parse(a.counts), sm = JSON.parse(a.summary);
+    return openForm('issues', null, {workpaper_id:a.workpaper_id, status:'Open', title:'Leaver and dormant account exceptions',
+      condition:`Comparing the account list with the HR leavers report as at ${sm.as_at}: ` + Object.entries(c).filter(([, v]) => v).map(([k, v]) => `${v} × ${k.toLowerCase()}`).join('; ') +
+        `. Details in the attached exceptions file.`,
+      criteria:`Leavers' access must be disabled within ${sm.sla_days} day(s) of termination; inactive accounts should be reviewed and disabled.`}); }
 });
 document.addEventListener('change', e => {
   const t = e.target;

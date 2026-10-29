@@ -9,8 +9,10 @@ and an evidence folder under --data (default: ./data).
 """
 import argparse
 import contextlib
+import csv
 import hashlib
 import hmac
+import io
 import json
 import os
 import queue
@@ -27,6 +29,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+import policycheck
+from analytics import SAMPLE_METHOD, DataError, access_test, draw_sample, exceptions_csv, guess_column, read_table
 from ocr import PDF, OcrEngine, kind_of, sniff, sniff_image
 
 ROOT = Path(__file__).resolve().parent
@@ -62,11 +66,22 @@ TABLES = {
     'issues': ['engagement_id', 'workpaper_id', 'title', 'condition', 'criteria', 'cause', 'effect', 'likelihood', 'impact',
                'recommendation', 'owner_id', 'due_date', 'status', 'response', 'validated_by', 'validated_at'],
     'time_entries': ['engagement_id', 'user_id', 'date', 'hours', 'activity', 'notes'],
+    # Written only by the server (sampling and analytics runs) so they cannot be altered afterwards.
+    'samples': ['engagement_id', 'workpaper_id', 'population_file_id', 'population_name', 'population_sha256', 'sheet',
+                'population_rows', 'size', 'seed', 'method', 'selected_rows', 'sample_file_id',
+                'verified_at', 'verified_by', 'verify_result'],
+    'analyses': ['engagement_id', 'workpaper_id', 'type', 'inputs', 'parameters', 'summary', 'counts', 'warnings',
+                 'exceptions', 'unmatched', 'exceptions_count', 'result_file_id'],
+    'setting_checks': ['engagement_id', 'workpaper_id', 'label', 'match_text', 'operator', 'expected', 'unit', 'policy_ref',
+                       'file_id', 'check_result', 'check_actual', 'check_source_file_id', 'check_source_line', 'check_note',
+                       'checked_at'],
 }
 # Set only by server workflows (sign-off, review notes, validation, uploads), never by a plain edit.
+CHECK_RESULTS = ('check_result', 'check_actual', 'check_source_file_id', 'check_source_line', 'check_note', 'checked_at')
 SYSTEM = {'prepared_by', 'prepared_at', 'reviewed_by', 'reviewed_at', 'responded_by', 'responded_at',
-          'cleared_by', 'cleared_at', 'validated_by', 'validated_at'}
-ENGAGEMENT_CHILDREN = ['risks', 'workpapers', 'evidence', 'files', 'review_notes', 'issues', 'time_entries']
+          'cleared_by', 'cleared_at', 'validated_by', 'validated_at', *CHECK_RESULTS}
+ENGAGEMENT_CHILDREN = ['risks', 'workpapers', 'evidence', 'files', 'review_notes', 'issues', 'time_entries',
+                       'samples', 'analyses', 'setting_checks']
 # Editing any other workpaper field after sign-off invalidates the sign-offs.
 WP_ADMIN_FIELDS = {'assigned_to', 'due_date', 'status'}
 AUDITEE_STATUSES = ('Remediation in progress', 'Ready for validation')
@@ -342,7 +357,7 @@ class Workbench:
             return role in MGMT
         if table == 'engagements':
             return role in MGMT or (action == 'update' and row.get('lead_id') == user['id'])
-        if table == 'files':
+        if table in ('files', 'samples', 'analyses'):
             return False
         if table == 'time_entries' and role not in MGMT:
             return row.get('user_id') == user['id']
@@ -357,7 +372,7 @@ class Workbench:
             if not rec.get('engagement_id'):
                 raise ApiError(400, 'engagement_id is required.')
             self._row(c, 'engagements', rec['engagement_id'])
-            for ref, t in (('workpaper_id', 'workpapers'), ('risk_id', 'risks'), ('issue_id', 'issues')):
+            for ref, t in (('workpaper_id', 'workpapers'), ('risk_id', 'risks'), ('issue_id', 'issues'), ('file_id', 'files')):
                 if rec.get(ref) and ref in TABLES[table]:
                     other = self._row(c, t, rec[ref])
                     if other['engagement_id'] != rec['engagement_id']:
@@ -376,6 +391,11 @@ class Workbench:
             data.setdefault(k, v)
         if table == 'workpapers' and data.get('status') in ('Ready for review', 'Complete'):
             data['status'] = 'Not started'
+        if table == 'setting_checks':
+            if not data.get('workpaper_id') or not data.get('label'):
+                raise ApiError(400, 'A setting check needs a workpaper and a setting name.')
+            if data.setdefault('operator', '=') not in policycheck.OPERATORS:
+                raise ApiError(400, 'Operator must be one of ' + ', '.join(policycheck.OPERATORS))
         if table == 'review_notes' and not data.get('workpaper_id'):
             raise ApiError(400, 'A review note must be attached to a workpaper.')
         ts = now()
@@ -420,6 +440,10 @@ class Workbench:
                 if signed and set(changes) - WP_ADMIN_FIELDS:
                     changes.update(prepared_by=None, prepared_at=None, reviewed_by=None, reviewed_at=None)
                     changes.setdefault('status', 'In progress')
+            if table == 'setting_checks':
+                if 'operator' in changes and changes['operator'] not in policycheck.OPERATORS:
+                    raise ApiError(400, 'Operator must be one of ' + ', '.join(policycheck.OPERATORS))
+                changes.update({k: None for k in CHECK_RESULTS})  # the rule changed: its last result no longer applies
             if table == 'issues' and 'status' in changes:
                 closed = changes['status'] == 'Closed'
                 changes.update(validated_by=user['id'] if closed else None, validated_at=now() if closed else None)
@@ -450,7 +474,8 @@ class Workbench:
                 if file_ids and row.get('workpaper_id'):
                     self._invalidate_signoffs(c, user, row['workpaper_id'], f"evidence removed: {row.get('title')}")
             elif table == 'workpapers':
-                c.execute('DELETE FROM review_notes WHERE workpaper_id = ?', (rid,))
+                for t in ('review_notes', 'samples', 'analyses', 'setting_checks'):
+                    c.execute(f'DELETE FROM {t} WHERE workpaper_id = ?', (rid,))
                 c.execute('UPDATE evidence SET workpaper_id = NULL WHERE workpaper_id = ?', (rid,))
                 c.execute('UPDATE issues SET workpaper_id = NULL WHERE workpaper_id = ?', (rid,))
             elif table == 'risks':
@@ -470,6 +495,183 @@ class Workbench:
         (self.file_dir / fid).unlink(missing_ok=True)
         for p in self.preview_dir.glob(fid + '-*.png'):
             p.unlink(missing_ok=True)
+
+    # ---------- testing tools: sampling, access analytics, setting checks ----------
+    def _staff(self, user):
+        if user['role'] not in STAFF:
+            raise ApiError(403, 'Not permitted.')
+
+    def _load_table(self, fid, sheet=None, engagement_id=None):
+        with self.db() as c:
+            rec = self._row(c, 'files', fid or '')
+        if engagement_id and rec['engagement_id'] != engagement_id:
+            raise ApiError(400, 'That file belongs to a different engagement.')
+        path = self.file_dir / rec['id']
+        if not path.exists():
+            raise ApiError(404, f"The stored file {rec['name']} is missing.")
+        raw = path.read_bytes()
+        try:
+            return rec, raw, read_table(raw, rec['name'], sheet or None)
+        except DataError as e:
+            raise ApiError(400, f"{rec['name']}: {e}")
+
+    def table_preview(self, user, fid, sheet=None):
+        self._staff(user)
+        rec, _, t = self._load_table(fid, sheet)
+        roles = ('user_key', 'user_enabled', 'user_last_logon', 'user_disabled_on', 'user_name', 'leaver_key', 'leaver_term_date')
+        return {'file_id': rec['id'], 'name': rec['name'], 'sheets': t['sheets'], 'sheet': t['sheet'], 'headers': t['headers'],
+                'rows': t['rows'][:8], 'row_count': len(t['rows']), 'guess': {r: guess_column(t['headers'], r) for r in roles}}
+
+    def draw_sample(self, user, wp_id, body):
+        self._staff(user)
+        try:
+            size = int(body.get('size') or 0)
+        except (TypeError, ValueError):
+            raise ApiError(400, 'Sample size must be a whole number.')
+        seed = str(body.get('seed') or '').strip() or str(secrets.randbelow(90_000_000) + 10_000_000)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', seed):
+            raise ApiError(400, 'The seed may contain letters, digits, - and _ only.')
+        with self.db() as c:
+            wp = self._row(c, 'workpapers', wp_id)
+        rec, _, t = self._load_table(body.get('file_id'), body.get('sheet'), wp['engagement_id'])
+        n = len(t['rows'])
+        try:
+            rows = draw_sample(n, size, seed)
+        except DataError as e:
+            raise ApiError(400, str(e))
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(['Sample #', 'Population row #'] + t['headers'])
+        for i, r in enumerate(rows, 1):
+            w.writerow([i, r] + t['rows'][r - 1])
+        data = out.getvalue().encode('utf-8-sig')
+        sheet = f", sheet {t['sheet']}" if t['sheet'] else ''
+        sample = {'id': new_id(), 'engagement_id': wp['engagement_id'], 'workpaper_id': wp_id, 'population_file_id': rec['id'],
+                  'population_name': rec['name'], 'population_sha256': rec['sha256'], 'sheet': t['sheet'], 'population_rows': str(n),
+                  'size': str(size), 'seed': seed, 'method': SAMPLE_METHOD, 'selected_rows': json.dumps(rows)}
+        notes = (f"Population: {rec['name']}{sheet}; {n} data rows; SHA-256 {rec['sha256']}.\nSeed: {seed}.\nMethod: {SAMPLE_METHOD}\n"
+                 f"Selected population rows: {', '.join(map(str, rows))}.")
+
+        def after(c, ev, f):
+            ts = now()
+            sample.update(sample_file_id=f['id'], created_at=ts, created_by=user['id'], updated_at=ts, updated_by=user['id'])
+            c.execute(f'INSERT INTO samples ({", ".join(sample)}) VALUES ({", ".join("?" * len(sample))})', list(sample.values()))
+            self._log(c, user, 'sample_drawn', 'samples', sample['id'], wp['engagement_id'],
+                      {'population': rec['name'], 'rows': n, 'size': size, 'seed': seed, 'workpaper_id': wp_id})
+            # Fill in the workpaper's population and sample size if the auditor hasn't yet.
+            c.execute('UPDATE workpapers SET population = COALESCE(population, ?), sample_size = COALESCE(sample_size, ?) WHERE id = ?',
+                      (f"{rec['name']}{sheet} ({n} rows)", str(size), wp_id))
+
+        self.attach_to_workpaper(user, wp_id, f'sample_{size}_of_{n}_seed_{seed}.csv', 'text/csv', io.BytesIO(data), len(data),
+                                 'Sample selection', f"Random sample of {size} from {rec['name']}", notes=notes, after=after)
+        return sample
+
+    def verify_sample(self, user, sid):
+        """Re-perform a sample: same population file (by fingerprint), same row count, same seed -> same rows."""
+        self._staff(user)
+        with self.db() as c:
+            s = self._row(c, 'samples', sid)
+        checks = []
+        try:
+            rec, raw, t = self._load_table(s['population_file_id'], s['sheet'])
+            sha = hashlib.sha256(raw).hexdigest()
+            checks.append(['Population file unchanged (SHA-256)', sha == s['population_sha256'], sha])
+            checks.append(['Population row count', len(t['rows']) == int(s['population_rows']), f"{len(t['rows'])} rows"])
+            again = draw_sample(len(t['rows']), int(s['size']), s['seed']) if checks[-1][1] else []
+            checks.append(['Re-drawn selection matches', again == json.loads(s['selected_rows']), f"seed {s['seed']}"])
+        except (ApiError, DataError) as e:
+            checks.append(['Population file available', False, str(e)])
+        ok = all(c[1] for c in checks)
+        result = 'Verified' if ok else 'Failed: ' + '; '.join(c[0] for c in checks if not c[1])
+        with self.db() as c:
+            c.execute('UPDATE samples SET verified_at = ?, verified_by = ?, verify_result = ? WHERE id = ?', (now(), user['id'], result, sid))
+            self._log(c, user, 'sample_verified' if ok else 'sample_verification_failed', 'samples', sid, s['engagement_id'],
+                      {'result': result})
+            out = self._row(c, 'samples', sid)
+        out['checks'] = checks
+        return out
+
+    def run_access_test(self, user, wp_id, body):
+        self._staff(user)
+        try:
+            as_at = datetime.strptime(str(body.get('as_at') or ''), '%Y-%m-%d').date()
+            sla, dormant = int(body.get('sla_days', 1)), int(body.get('dormant_days', 90))
+            assert 0 <= sla <= 3650 and 1 <= dormant <= 3650
+        except (ValueError, AssertionError):
+            raise ApiError(400, 'Enter the extraction date (as at), and day thresholds between 0 and 3650.')
+        m = {k: str(v) for k, v in (body.get('mapping') or {}).items() if v}
+        if not m.get('user_key') or not m.get('leaver_key') or not m.get('leaver_term_date'):
+            raise ApiError(400, 'Choose the account name column in both files and the termination date column.')
+        with self.db() as c:
+            wp = self._row(c, 'workpapers', wp_id)
+        u = body.get('users') or {}
+        lv = body.get('leavers') or {}
+        urec, _, ut = self._load_table(u.get('file_id'), u.get('sheet'), wp['engagement_id'])
+        lrec, _, lt = self._load_table(lv.get('file_id'), lv.get('sheet'), wp['engagement_id'])
+        try:
+            res = access_test(ut, lt, m, as_at, sla, dormant)
+        except DataError as e:
+            raise ApiError(400, str(e))
+        n_exc = len(res['exceptions'])
+        inputs = [{'role': 'Accounts', 'file_id': urec['id'], 'name': urec['name'], 'sha256': urec['sha256'], 'sheet': ut['sheet'], 'rows': len(ut['rows'])},
+                  {'role': 'Leavers', 'file_id': lrec['id'], 'name': lrec['name'], 'sha256': lrec['sha256'], 'sheet': lt['sheet'], 'rows': len(lt['rows'])}]
+        params = {'as_at': as_at.isoformat(), 'sla_days': sla, 'dormant_days': dormant, 'mapping': m}
+        rec = {'id': new_id(), 'engagement_id': wp['engagement_id'], 'workpaper_id': wp_id, 'type': 'access_leavers_dormant',
+               'inputs': json.dumps(inputs), 'parameters': json.dumps(params), 'summary': json.dumps(res['summary']),
+               'counts': json.dumps(res['counts']), 'warnings': json.dumps(res['warnings'][:50]),
+               'exceptions': json.dumps(res['exceptions'][:2000]), 'unmatched': json.dumps(res['unmatched_leavers'][:2000]),
+               'exceptions_count': str(n_exc)}
+        notes = ('Inputs: ' + '; '.join(f"{i['role']}: {i['name']} ({i['rows']} rows, SHA-256 {i['sha256']})" for i in inputs) +
+                 f".\nAs at {as_at.isoformat()}; leaver SLA {sla} day(s); dormant after {dormant} days.\n" +
+                 'Results: ' + ', '.join(f'{k}: {v}' for k, v in res['counts'].items()) +
+                 f"; leavers not found in the account list: {len(res['unmatched_leavers'])}.")
+
+        def after(c, ev, f):
+            ts = now()
+            rec.update(result_file_id=f['id'], created_at=ts, created_by=user['id'], updated_at=ts, updated_by=user['id'])
+            c.execute(f'INSERT INTO analyses ({", ".join(rec)}) VALUES ({", ".join("?" * len(rec))})', list(rec.values()))
+            self._log(c, user, 'analysis_run', 'analyses', rec['id'], wp['engagement_id'], {'counts': res['counts'], 'workpaper_id': wp_id})
+
+        data = exceptions_csv(res)
+        self.attach_to_workpaper(user, wp_id, f'access_test_exceptions_{as_at.isoformat()}.csv', 'text/csv', io.BytesIO(data), len(data),
+                                 'Testing performed / tick-marked results',
+                                 f'Access test (leavers & dormant accounts): {n_exc} exception(s)', notes=notes, after=after)
+        return rec
+
+    def _readable_files(self, c, where, arg):
+        rows = c.execute(f"""SELECT f.id, f.name, f.kind, f.ocr_text AS text, f.ocr_method FROM files f JOIN evidence e ON e.id = f.evidence_id
+                             WHERE {where} AND f.ocr_status = 'done' AND f.ocr_text IS NOT NULL""", (arg,)).fetchall()
+        # Screenshots first, then scanned documents, then document text: settings come from system screens.
+        rank = lambda r: 0 if r['kind'] == 'image' else 1 if (r['ocr_method'] or '') != 'PDF text' else 2
+        return [dict(r) for r in sorted(rows, key=rank)]
+
+    def suggest_setting_checks(self, user, wp_id):
+        self._staff(user)
+        with self.db() as c:
+            wp = self._row(c, 'workpapers', wp_id)
+            files = self._readable_files(c, 'e.engagement_id = ?', wp['engagement_id'])
+            have = {r['label'].lower() for r in c.execute('SELECT label FROM setting_checks WHERE workpaper_id = ?', (wp_id,))}
+        return [p for p in policycheck.suggest(files) if p['label'].lower() not in have]
+
+    def run_setting_checks(self, user, wp_id):
+        self._staff(user)
+        with self.db() as c:
+            wp = self._row(c, 'workpapers', wp_id)
+            rules = [dict(r) for r in c.execute('SELECT * FROM setting_checks WHERE workpaper_id = ? ORDER BY created_at', (wp_id,))]
+            if not rules:
+                raise ApiError(400, 'Add at least one setting check first.')
+            files = self._readable_files(c, 'e.workpaper_id = ?', wp_id)
+            ts, changed, counts = now(), False, {'Pass': 0, 'Exception': 0, 'Not found': 0}
+            for r in rules:
+                res = policycheck.evaluate(r, files)
+                res['checked_at'] = ts
+                counts[res['check_result']] += 1
+                changed |= any((r.get(k) or None) != (res.get(k) or None) for k in ('check_result', 'check_actual', 'check_source_file_id'))
+                c.execute(f'UPDATE setting_checks SET {", ".join(k + " = ?" for k in res)} WHERE id = ?', (*res.values(), r['id']))
+            self._log(c, user, 'settings_checked', 'workpapers', wp_id, wp['engagement_id'], counts)
+            if changed:
+                self._invalidate_signoffs(c, user, wp_id, 'setting check results changed')
+            return [dict(r) for r in c.execute('SELECT * FROM setting_checks WHERE workpaper_id = ? ORDER BY created_at', (wp_id,))]
 
     # ---------- workflows ----------
     def sign_off(self, user, wp_id, kind):
@@ -593,7 +795,8 @@ class Workbench:
         self._queue_ocr(rec)
         return rec
 
-    def attach_to_workpaper(self, user, wp_id, name, content_type, stream, length, purpose=None, description=None):
+    def attach_to_workpaper(self, user, wp_id, name, content_type, stream, length, purpose=None, description=None,
+                            notes=None, after=None):
         """One-step upload next to a test: creates the evidence record and stores the file together."""
         if user['role'] not in STAFF:
             raise ApiError(403, 'Not permitted.')
@@ -603,13 +806,15 @@ class Workbench:
         ts = now()
         ev = {'id': new_id(), 'engagement_id': wp['engagement_id'], 'workpaper_id': wp_id, 'title': (description or '').strip()[:500] or name,
               'purpose': (purpose or '').strip()[:100] or None, 'pbc_status': 'Received', 'collected_by': user.get('name'),
-              'collected_on': ts[:10], 'created_at': ts, 'created_by': user['id'], 'updated_at': ts, 'updated_by': user['id']}
+              'collected_on': ts[:10], 'notes': notes, 'created_at': ts, 'created_by': user['id'], 'updated_at': ts, 'updated_by': user['id']}
         try:
             with self.db() as c:
                 c.execute(f'INSERT INTO evidence ({", ".join(ev)}) VALUES ({", ".join("?" * len(ev))})', list(ev.values()))
                 self._log(c, user, 'create', 'evidence', ev['id'], wp['engagement_id'],
                           {k: ev[k] for k in ('title', 'purpose', 'workpaper_id') if ev[k]})
                 f = self._insert_file(c, user, fid, ev, name, content_type, length, sha)
+                if after:  # records that must exist together with this file (sample, analysis)
+                    after(c, ev, f)
         except BaseException:
             (self.file_dir / fid).unlink(missing_ok=True)
             raise
@@ -847,6 +1052,19 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length') or 0)
             name = unquote(self.headers.get('X-Filename') or 'file')
             return self._json(201, app.save_file(user, rest[0], name, self.headers.get('Content-Type'), self.rfile, length))
+        elif head == 'files' and len(rest) == 2 and rest[1] == 'table' and method == 'GET':
+            return self._json(200, app.table_preview(user, rest[0], q.get('sheet')))
+        elif head == 'workpapers' and len(rest) == 2 and rest[1] == 'sample' and method == 'POST':
+            return self._json(201, app.draw_sample(user, rest[0], self._body()))
+        elif head == 'samples' and len(rest) == 2 and rest[1] == 'verify' and method == 'POST':
+            return self._json(200, app.verify_sample(user, rest[0]))
+        elif head == 'workpapers' and len(rest) == 2 and rest[1] == 'access_test' and method == 'POST':
+            return self._json(201, app.run_access_test(user, rest[0], self._body()))
+        elif head == 'workpapers' and len(rest) == 3 and rest[1] == 'setting_checks' and method == 'POST':
+            if rest[2] == 'run':
+                return self._json(200, app.run_setting_checks(user, rest[0]))
+            if rest[2] == 'suggest':
+                return self._json(200, app.suggest_setting_checks(user, rest[0]))
         elif head == 'workpapers' and len(rest) == 2 and rest[1] == 'attach' and method == 'POST':
             h = self.headers
             return self._json(201, app.attach_to_workpaper(user, rest[0], unquote(h.get('X-Filename') or 'file'), h.get('Content-Type'),

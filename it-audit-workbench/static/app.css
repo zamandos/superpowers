@@ -94,3 +94,11 @@ mark{background:#ffe066;color:#1d2330;border-radius:2px}
 .ocr-busy{animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.45}}
 .pager{margin-bottom:8px;justify-content:center}.pager .muted{min-width:110px;text-align:center}
+.tool{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}
+.tool:first-of-type{border-top:0;margin-top:0;padding-top:0}
+.tool h3{font-size:14px;margin:0;flex:1}
+.tool>p.muted{margin:0 0 8px;font-size:13px}
+.clamp{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;max-width:320px;font-size:12px}
+fieldset.side{border:1px solid var(--line);border-radius:8px;margin:0 0 12px;padding:10px 12px}
+fieldset.side legend{font-weight:600;padding:0 6px}
+.preview table{font-size:12px}.preview td,.preview th{padding:4px 6px;white-space:nowrap}
