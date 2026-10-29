@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import secrets
 import sqlite3
@@ -25,6 +26,8 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
+
+from ocr import OcrEngine, sniff_image
 
 ROOT = Path(__file__).resolve().parent
 STATIC = {'/': 'index.html', '/app.js': 'app.js', '/app.css': 'app.css'}
@@ -52,7 +55,8 @@ TABLES = {
                    'prepared_by', 'prepared_at', 'reviewed_by', 'reviewed_at'],
     'evidence': ['engagement_id', 'workpaper_id', 'issue_id', 'title', 'purpose', 'type', 'pbc_status', 'requested_from', 'requested_on',
                  'collected_by', 'collected_on', 'notes'],
-    'files': ['evidence_id', 'engagement_id', 'name', 'size', 'content_type', 'sha256'],
+    'files': ['evidence_id', 'engagement_id', 'name', 'size', 'content_type', 'sha256',
+              'ocr_status', 'ocr_text', 'ocr_confidence', 'ocr_engine', 'ocr_at'],
     'review_notes': ['engagement_id', 'workpaper_id', 'note', 'status', 'response',
                      'responded_by', 'responded_at', 'cleared_by', 'cleared_at'],
     'issues': ['engagement_id', 'workpaper_id', 'title', 'condition', 'criteria', 'cause', 'effect', 'likelihood', 'impact',
@@ -96,7 +100,7 @@ class ApiError(Exception):
 class Workbench:
     """Data access, permissions and audit workflows. HTTP-agnostic so it can be tested directly."""
 
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, ocr=None):
         self.data_dir = Path(data_dir)
         self.file_dir = self.data_dir / 'evidence'
         self.file_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +109,13 @@ class Workbench:
         self.lock = threading.Lock()
         with self.db() as c:
             self._schema(c)
+        self.ocr = ocr or OcrEngine()
+        self.ocr_queue = queue.Queue()
+        threading.Thread(target=self._ocr_worker, daemon=True).start()
+        with self.db() as c:  # resume OCR interrupted by a restart
+            pending = [r['id'] for r in c.execute("SELECT id FROM files WHERE ocr_status IN ('queued', 'running')")]
+        for fid in pending:
+            self.ocr_queue.put(fid)
 
     @contextlib.contextmanager
     def db(self):
@@ -540,8 +551,10 @@ class Workbench:
 
     def _insert_file(self, c, user, fid, ev, name, content_type, length, sha):
         ts = now()
+        is_image = sniff_image(self.file_dir / fid) is not None
         rec = {'id': fid, 'evidence_id': ev['id'], 'engagement_id': ev['engagement_id'], 'name': name, 'size': str(length),
                'content_type': (content_type or 'application/octet-stream')[:100], 'sha256': sha,
+               'ocr_status': ('queued' if self.ocr.available else 'unavailable') if is_image else None,
                'created_at': ts, 'created_by': user['id'], 'updated_at': ts, 'updated_by': user['id']}
         c.execute(f'INSERT INTO files ({", ".join(rec)}) VALUES ({", ".join("?" * len(rec))})', list(rec.values()))
         self._log(c, user, 'upload', 'files', fid, ev['engagement_id'], {'name': name, 'sha256': sha, 'evidence_id': ev['id']})
@@ -566,10 +579,12 @@ class Workbench:
         fid, name, sha = self._receive(user, name, stream, length)
         try:
             with self.db() as c:
-                return self._insert_file(c, user, fid, ev, name, content_type, length, sha)
+                rec = self._insert_file(c, user, fid, ev, name, content_type, length, sha)
         except BaseException:
             (self.file_dir / fid).unlink(missing_ok=True)
             raise
+        self._queue_ocr(rec)
+        return rec
 
     def attach_to_workpaper(self, user, wp_id, name, content_type, stream, length, purpose=None, description=None):
         """One-step upload next to a test: creates the evidence record and stores the file together."""
@@ -591,7 +606,70 @@ class Workbench:
         except BaseException:
             (self.file_dir / fid).unlink(missing_ok=True)
             raise
+        self._queue_ocr(f)
         return {'evidence': ev, 'file': f}
+
+    # ---------- OCR ----------
+    SYSTEM_USER = {'id': 'system', 'name': 'OCR service'}
+
+    def _queue_ocr(self, rec):
+        if rec.get('ocr_status') == 'queued':
+            self.ocr_queue.put(rec['id'])
+
+    def request_ocr(self, user, fid):
+        if user['role'] not in STAFF:
+            raise ApiError(403, 'Not permitted.')
+        if not self.ocr.available:
+            raise ApiError(503, 'OCR is not installed on the server. Ask your administrator to install Tesseract.')
+        with self.db() as c:
+            rec = self._row(c, 'files', fid)
+            if not sniff_image(self.file_dir / fid):
+                raise ApiError(400, 'OCR works on image files (PNG, JPEG, GIF, BMP, TIFF, WebP).')
+            if rec['ocr_status'] in ('queued', 'running'):
+                return rec
+            c.execute("UPDATE files SET ocr_status = 'queued' WHERE id = ?", (fid,))
+            self._log(c, user, 'ocr_requested', 'files', fid, rec['engagement_id'], {'name': rec['name']})
+        self.ocr_queue.put(fid)
+        with self.db() as c:
+            return self._row(c, 'files', fid)
+
+    def _ocr_worker(self):
+        while True:
+            fid = self.ocr_queue.get()
+            try:
+                self.run_ocr(fid)
+            except Exception as e:  # never let one bad file stop the worker
+                sys.stderr.write(f'OCR worker error for {fid}: {e!r}\n')
+
+    def run_ocr(self, fid):
+        with self.db() as c:
+            rec = c.execute('SELECT * FROM files WHERE id = ?', (fid,)).fetchone()
+            if not rec:
+                return
+            c.execute("UPDATE files SET ocr_status = 'running' WHERE id = ?", (fid,))
+        try:
+            text, conf = self.ocr.read(self.file_dir / fid)
+            fields = {'ocr_status': 'done', 'ocr_text': text, 'ocr_confidence': None if conf is None else str(conf)}
+            detail = {'name': rec['name'], 'confidence': conf, 'characters': len(text)}
+        except Exception as e:
+            fields = {'ocr_status': 'failed', 'ocr_text': f'OCR failed: {e}'[:1000], 'ocr_confidence': None}
+            detail = {'name': rec['name'], 'error': str(e)[:300]}
+        fields.update(ocr_engine=self.ocr.version, ocr_at=now())
+        with self.db() as c:
+            c.execute(f'UPDATE files SET {", ".join(k + " = ?" for k in fields)} WHERE id = ?', (*fields.values(), fid))
+            self._log(c, self.SYSTEM_USER, 'ocr_' + fields['ocr_status'], 'files', fid, rec['engagement_id'], detail)
+
+    def view_image(self, user, fid):
+        """Inline image for the OCR viewer. The type comes from the file's content, never from the uploader."""
+        if user['role'] not in STAFF:
+            raise ApiError(403, 'Not permitted.')
+        with self.db() as c:
+            rec = self._row(c, 'files', fid)
+            mime = sniff_image(self.file_dir / fid)
+            if not mime:
+                raise ApiError(415, 'Only images can be previewed.')
+            self._log(c, user, 'view', 'files', fid, rec['engagement_id'], {'name': rec['name']})
+        return mime, self.file_dir / fid
 
     def open_file(self, user, fid):
         if user['role'] not in STAFF:
@@ -735,6 +813,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(201, app.attach_to_workpaper(user, rest[0], unquote(h.get('X-Filename') or 'file'), h.get('Content-Type'),
                                                            self.rfile, int(h.get('Content-Length') or 0),
                                                            unquote(h.get('X-Purpose') or ''), unquote(h.get('X-Description') or '')))
+        elif head == 'ocr' and not rest and method == 'GET':
+            return self._json(200, self.app.ocr.describe())
+        elif head == 'files' and len(rest) == 2 and rest[1] == 'ocr' and method == 'POST':
+            return self._json(200, app.request_ocr(user, rest[0]))
+        elif head == 'files' and len(rest) == 2 and rest[1] == 'view' and method == 'GET':
+            mime, path = app.view_image(user, rest[0])
+            data = path.read_bytes()
+            self._headers(200, mime, len(data), {'Content-Disposition': 'inline'})
+            return self.wfile.write(data)
         elif head == 'files' and len(rest) == 1 and method == 'GET':
             rec, path = app.open_file(user, rest[0])
             data = path.read_bytes()
@@ -760,8 +847,8 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(404, 'Not found.')
 
 
-def make_server(data_dir, host='127.0.0.1', port=8080, secure_cookie=False):
-    app = Workbench(data_dir)
+def make_server(data_dir, host='127.0.0.1', port=8080, secure_cookie=False, ocr=None):
+    app = Workbench(data_dir, ocr)
     handler = type('BoundHandler', (Handler,), {'app': app, 'secure_cookie': secure_cookie})
     return ThreadingHTTPServer((host, port), handler), app
 
@@ -778,6 +865,8 @@ def main():
     if pw:
         print(f'\nCreated first administrator account.\n  username: admin\n  password: {pw}\n'
               'You will be asked to change it at first sign-in.\n', flush=True)
+    o = app.ocr.describe()
+    print(f"OCR: {o['engine'] + (' with image enhancement' if o['enhanced'] else ' (install Pillow for better accuracy)') if o['available'] else 'not available - install Tesseract to read screenshots'}", flush=True)
     print(f'Audit Workbench running at http://{a.host}:{a.port}  (data: {a.data})', flush=True)
     try:
         srv.serve_forever()

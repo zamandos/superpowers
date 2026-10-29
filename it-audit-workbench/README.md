@@ -2,7 +2,7 @@
 
 Audit Workbench is a self-hosted, multi-user audit management application for IT audit teams. It covers the full cycle from the risk-based audit universe to issue follow-up, with reviewer sign-off and a complete audit trail.
 
-It needs only **Python 3.9+**. There are no packages to install and no internet access is required. Data stays on your own server in a SQLite database and an evidence folder.
+It needs only **Python 3.9+**. Screenshot OCR additionally uses Tesseract if it's installed (see below). There are no packages to install and no internet access is required. Data stays on your own server in a SQLite database and an evidence folder.
 
 ## Quick start
 
@@ -50,6 +50,20 @@ Put it behind your HTTPS reverse proxy (nginx, IIS, Caddy) and use `--secure-coo
 
 Several files can go up at once, with a progress bar. The workpapers list also has an **Attach** link on every row, and it shows how many files each test has. Attaching or removing evidence on a signed-off test removes its sign-offs, so the reviewer sees the change.
 
+**Reading screenshots (OCR).** When an auditor attaches a screenshot (PNG, JPEG, GIF, BMP, TIFF or WebP), the server reads the text in the background. Uploads stay instant, and the file shows *Reading text…* until it's done. Then **View image & text** opens the screenshot beside the extracted text, with:
+- **Find in text**, which highlights matches, e.g. "password length".
+- **Copy text.**
+- **Add to test results**, which appends the text, clearly labelled as OCR output, to the test's results notes.
+- **Read again**, which re-runs OCR.
+
+Each result carries a confidence score, and results below 75% are flagged for checking. The **Evidence & PBC** tab can search across file names, descriptions and all text read from screenshots, e.g. find every screenshot that mentions "lockout".
+
+A few rules keep OCR honest as evidence:
+- OCR runs **on your server** with Tesseract, so screenshots never leave your network.
+- The original image stays the evidence. The text is a reading aid, kept separate and never edited.
+- Whether a file is an image is decided from its content, not its name.
+- Viewing an image, and each OCR run with its engine version and confidence, is recorded in the audit trail.
+
 **Evidence and PBC requests.** Track each request as requested, received, accepted, or rejected and to be resubmitted. Attach files of up to 50 MB each. Each file is stored with a **SHA-256 fingerprint**, and every upload, download and removal is logged.
 
 **Issues.** Findings are written as condition, criteria, cause, effect and recommendation, with a management owner, due date, status and response. **Criticality = likelihood × impact**:
@@ -70,6 +84,21 @@ You can raise an issue straight from a failed workpaper. The **Issue tracker** c
 - **Report** produces a draft report that you can print or save as PDF, plus CSV exports.
 
 **Audit trail.** Every create, edit (with old → new values), delete, sign-off, upload, download and sign-in is logged. Managers can view it per workpaper, per engagement, or for everything.
+
+## Enabling OCR (optional)
+
+OCR needs the free Tesseract engine on the server. Without it, everything else works and screenshots show "OCR not installed". **Admin** shows whether OCR is active.
+
+| Server | Install |
+|---|---|
+| Ubuntu / Debian | `sudo apt install tesseract-ocr` |
+| Red Hat / Fedora | `sudo dnf install tesseract` |
+| macOS | `brew install tesseract` |
+| Windows | UB Mannheim Tesseract installer; add it to PATH or set `AUDIT_TESSERACT=C:\Program Files\Tesseract-OCR\tesseract.exe` |
+
+For best accuracy on small screenshot text, also install Pillow (`pip install pillow`). Images are then converted to greyscale and enlarged before reading.
+
+For other languages, install the Tesseract language pack and set `AUDIT_OCR_LANG`, e.g. `eng+fra`. Restart the server after installing.
 
 ## Working as a team
 

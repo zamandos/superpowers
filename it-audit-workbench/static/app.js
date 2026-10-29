@@ -151,6 +151,7 @@ async function run(fn){ try { await fn(); } catch (e) { toast(e.message, true); 
 async function loadAll(){
   S.me = await api('GET', 'me');
   S.users = await api('GET', 'users');
+  if (isStaff()) S.ocr = await api('GET', 'ocr');
   const tabs = isStaff() ? TABLES : ['engagements', 'issues'];
   const res = await Promise.all(tabs.map(t => api('GET', t)));
   tabs.forEach((t, i) => S[t] = res[i]);
@@ -184,6 +185,7 @@ function fieldHtml(f, v, isNew){
   return `<div class="${f.w ? 'wide' : ''}"><label for="${id}">${esc(f.l)}${req ? ' *' : ''}</label>${inp}${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ''}</div>`;
 }
 function modal(title, inner, onSubmit, opts = {}){
+  dlg.classList.remove('wide');
   dlg.innerHTML = `<form><h3>${esc(title)}</h3>${inner}<div id="calc" class="muted" style="margin-top:8px"></div>
     <div class="dlgbar">${opts.noCancel ? '' : '<button type="button" class="btn ghost" data-close>Cancel</button>'}<button class="btn" id="saveBtn">${esc(opts.ok || 'Save')}</button></div></form>`;
   const form = dlg.querySelector('form');
@@ -328,7 +330,7 @@ const V = {
         ['Status', u => u.active ? 'Active' : '<span class="muted">Disabled</span>']], S.users, {actions:u => `<button class="link" data-edit="users" data-id="${u.id}">Edit</button>`})}
       <p class="muted">Roles: <b>Administrator</b> manages users and everything else. <b>Audit manager</b> owns the universe, plan and engagements and signs off as reviewer.
       <b>Auditor</b> prepares workpapers, evidence and issues. <b>Auditee</b> only sees issues they own and records management responses.</p></div>` : '') +
-      `<div class="card"><div class="toolbar"><h2>Audit trail</h2><button class="btn ghost" data-loadlog="all">Load latest 500 events</button></div><div id="logBox" class="muted">Every create, edit, delete, sign-off, upload, download and sign-in is recorded.</div></div>`;
+      ocrAdminCard() + `<div class="card"><div class="toolbar"><h2>Audit trail</h2><button class="btn ghost" data-loadlog="all">Load latest 500 events</button></div><div id="logBox" class="muted">Every create, edit, delete, sign-off, upload, download and sign-in is recorded.</div></div>`;
   },
   myissues(){
     const rows = [...S.issues].sort((a, b) => riskScore(b.likelihood, b.impact) - riskScore(a.likelihood, a.impact));
@@ -407,6 +409,8 @@ const EV = {
     const E = inEng('evidence');
     return `<div class="card"><div class="toolbar"><h2>Evidence &amp; PBC requests</h2><button class="btn" data-new="evidence">New request / evidence</button></div>
       <p class="muted" style="margin-top:0">Files are stored on the server with a SHA-256 fingerprint so you can show they were not altered after collection. Every upload and download is logged.</p>
+      <label for="evSearch" class="muted" style="font-size:12px;font-weight:600">Search evidence, including text read from screenshots</label>
+      <input id="evSearch" type="search" value="${esc(S.q || '')}" placeholder="e.g. lockout threshold, svc-backup, MFA"><div id="evResults" style="margin:8px 0 16px"></div>
       ${evidenceTable(E)}</div>`;
   },
   notes(){
@@ -467,7 +471,7 @@ function evidenceTable(E){
     ['Received', x => esc(x.collected_on) + (x.collected_by ? `<div class="muted">by ${esc(x.collected_by)}</div>` : '')],
     ['Files', x => S.files.filter(f => f.evidence_id === x.id).map(f => `<div><button class="link" data-file="${f.id}" data-name="${esc(f.name)}">${esc(f.name)}</button> <span class="muted">${fmtSize(f.size)}</span>
       ${isMgmt() || f.created_by === S.me.id ? `<button class="link" data-delfile="${f.id}" title="Remove file">&times;</button>` : ''}
-      <div class="mono muted" title="SHA-256 fingerprint">SHA-256 ${esc(f.sha256)}</div></div>`).join('') + `<label class="link" style="cursor:pointer">+ Upload<input type="file" multiple hidden data-upload="${x.id}"></label>`]],
+      <div class="mono muted" title="SHA-256 fingerprint">SHA-256 ${esc(f.sha256)}</div>${ocrChip(f)}</div>`).join('') + `<label class="link" style="cursor:pointer">+ Upload<input type="file" multiple hidden data-upload="${x.id}"></label>`]],
     E, {actions:x => editDel('evidence', x), empty:'No evidence yet.'});
 }
 
@@ -522,7 +526,7 @@ function testEvidence(w){
       ${signed ? '<div class="over" style="margin-top:6px">This test is signed off. Attaching or removing evidence removes the sign-offs so it can be re-reviewed.</div>' : ''}
       <div id="upProg"></div></div>
     ${rows.length ? table([
-      ['File', r => r.f ? `<button class="link" data-file="${r.f.id}" data-name="${esc(r.f.name)}">${esc(r.f.name)}</button><div class="muted">${fmtSize(r.f.size)}</div>`
+      ['File', r => r.f ? `<button class="link" data-file="${r.f.id}" data-name="${esc(r.f.name)}">${esc(r.f.name)}</button><div class="muted">${fmtSize(r.f.size)}</div>${ocrChip(r.f)}`
         : `${badge(r.x.pbc_status || 'No file')} <label class="link attach">Upload<input type="file" multiple hidden data-upload="${r.x.id}"></label>`],
       ['Purpose', r => r.x.purpose ? badge(r.x.purpose) : ''],
       ['Description', r => (!r.f || r.x.title !== r.f.name ? `<b>${esc(r.x.title)}</b>` : '') + (r.x.notes ? `<div class="muted">${esc(r.x.notes)}</div>` : '')],
@@ -565,6 +569,114 @@ async function attachFiles(wpId, files){
   await refresh();
 }
 
+/* ---------- OCR ---------- */
+const OCR_BUSY = ['queued', 'running'];
+const ocrConf = f => f.ocr_confidence != null && f.ocr_confidence !== '' ? Math.round(+f.ocr_confidence) : null;
+function ocrChip(f){
+  if (OCR_BUSY.includes(f.ocr_status)) return '<div><span class="badge ocr-busy">Reading text&hellip;</span></div>';
+  if (f.ocr_status === 'done'){
+    const c = ocrConf(f);
+    return `<div><button class="link" data-ocr="${f.id}">View image &amp; text</button> ${!f.ocr_text ? badge('no text found')
+      : c != null ? `<span class="badge ${c < 75 ? 'b-Medium' : ''}" title="Average OCR confidence">${c}% confidence</span>` : ''}</div>`;
+  }
+  if (f.ocr_status === 'failed') return `<div><button class="link" data-ocr="${f.id}">OCR failed &ndash; details</button></div>`;
+  if (f.ocr_status === 'unavailable') return '<div class="muted" title="Install Tesseract on the server to read screenshots">OCR not installed</div>';
+  return '';
+}
+// While any screenshot is being read, check back every few seconds (but never while someone is typing).
+function scheduleOcrPoll(){
+  clearTimeout(S.poll);
+  if (!isStaff() || !S.files.some(f => OCR_BUSY.includes(f.ocr_status))) return;
+  S.poll = setTimeout(function tick(){
+    const a = document.activeElement;
+    if (S.busy || (a && $('#view')?.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) S.poll = setTimeout(tick, 3000);
+    else run(refresh);
+  }, 3000);
+}
+function openOcr(fid){
+  const f = byId('files', fid); if (!f) return;
+  S.ocrFile = fid;
+  const ev = byId('evidence', f.evidence_id) || {}, w = byId('workpapers', ev.workpaper_id), c = ocrConf(f);
+  const text = f.ocr_status === 'done' ? f.ocr_text || '' : '';
+  dlg.innerHTML = `<form><div class="toolbar"><h3 style="margin:0;flex:1;min-width:0;overflow-wrap:anywhere">${esc(f.name)}</h3>
+      <button type="button" class="btn ghost" data-file="${f.id}" data-name="${esc(f.name)}">Download original</button>
+      <button type="button" class="btn ghost" data-close>Close</button></div>
+    <div class="ocr-grid">
+      <div class="ocr-img" title="Click to toggle actual size"><img src="/api/files/${f.id}/view" alt="${esc(f.name)}"></div>
+      <div><div class="toolbar" style="margin-bottom:6px"><b style="flex:1">Text read from the image</b>${c != null && text ? badge(c + '% confidence', c < 75 ? 'b-Medium' : '') : ''}</div>
+        ${f.ocr_status === 'failed' ? `<p class="over">${esc(f.ocr_text)}</p>` : ''}
+        ${c != null && c < 75 && text ? '<p class="over" style="margin:0 0 6px">Low confidence: check every value against the image.</p>' : ''}
+        <input id="ocrFind" type="search" placeholder="Find in text, e.g. password length" aria-label="Find in text">
+        <pre id="ocrText" class="ocr-text">${esc(text || (f.ocr_status === 'done' ? '(No text was found in this image.)' : ''))}</pre>
+        <div class="toolbar">${text ? '<button type="button" class="btn" id="ocrCopy">Copy text</button>' : ''}
+          ${w && text ? `<button type="button" class="btn ghost" id="ocrAppend">Add to test results (${esc(w.ref)})</button>` : ''}
+          ${S.ocr && S.ocr.available ? '<button type="button" class="btn ghost" id="ocrRerun">Read again</button>' : ''}</div>
+        <p class="muted" style="font-size:12px">Read by ${esc(f.ocr_engine || 'OCR')}${f.ocr_at ? ' on ' + esc(fmtTs(f.ocr_at)) : ''}.
+          OCR is an aid: verify key values against the screenshot before relying on them. The original image remains the evidence.</p></div></div></form>`;
+  dlg.classList.add('wide');
+  dlg.oncancel = null;
+  dlg.querySelector('form').onsubmit = e => e.preventDefault();
+  dlg.querySelector('.ocr-img').onclick = e => e.currentTarget.classList.toggle('actual');
+  const copy = $('#ocrCopy');
+  if (copy) copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(text); }
+    catch { const r = document.createRange(); r.selectNodeContents($('#ocrText')); getSelection().removeAllRanges(); getSelection().addRange(r); document.execCommand('copy'); }
+    toast('Text copied');
+  };
+  const add = $('#ocrAppend');
+  if (add) add.onclick = () => run(async () => {
+    if ((w.prepared_by || w.reviewed_by) && !confirm(`${w.ref} is signed off. Changing its results removes the sign-offs. Continue?`)) return;
+    const block = `[Text read by OCR from ${f.name} - verify against the image]\n${text}`;
+    await api('PUT', 'workpapers/' + w.id, {notes:(w.notes ? w.notes + '\n\n' : '') + block, _version:w.updated_at});
+    dlg.close(); toast(`Added to ${w.ref} results`); await refresh();
+  });
+  const again = $('#ocrRerun');
+  if (again) again.onclick = () => run(async () => { await api('POST', `files/${f.id}/ocr`, {}); dlg.close(); toast('Reading the image again'); await refresh(); });
+  dlg.showModal();
+}
+const reEscape = q => q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Wrap case-insensitive matches of q in <mark>, escaping everything else.
+function markText(text, q){
+  if (!q) return esc(text);
+  return String(text).split(new RegExp(`(${reEscape(q)})`, 'ig')).map((part, i) => i % 2 ? `<mark>${esc(part)}</mark>` : esc(part)).join('');
+}
+function highlightOcr(q){
+  const pre = $('#ocrText'), f = byId('files', S.ocrFile);
+  if (!pre || !f || !f.ocr_text) return;
+  pre.innerHTML = markText(f.ocr_text, q.trim());
+  pre.querySelector('mark')?.scrollIntoView({block:'center'});
+}
+function showSearch(){
+  const box = $('#evResults'); if (!box) return;
+  const q = (S.q || '').trim(), ql = q.toLowerCase();
+  if (q.length < 2){ box.innerHTML = ''; return; }
+  const snippet = (t, i) => { const a = Math.max(0, i - 70), b = Math.min(t.length, i + q.length + 70);
+    return (a ? '&hellip;' : '') + markText(t.slice(a, b), q) + (b < t.length ? '&hellip;' : ''); };
+  const hits = [];
+  for (const f of inEng('files')){
+    const ev = byId('evidence', f.evidence_id) || {};
+    const fields = [['Text in image', f.ocr_text], ['File name', f.name], ['Description', [ev.title, ev.purpose, ev.notes].filter(Boolean).join(' · ')]];
+    const m = fields.find(([, t]) => t && t.toLowerCase().includes(ql));
+    if (m) hits.push({id:f.id, f, ev, where:m[0], snip:snippet(m[1], m[1].toLowerCase().indexOf(ql))});
+  }
+  box.innerHTML = hits.length ? table([
+    ['File', h => h.f.ocr_status === 'done' ? `<button class="link" data-ocr="${h.f.id}">${esc(h.f.name)}</button>` : `<button class="link" data-file="${h.f.id}" data-name="${esc(h.f.name)}">${esc(h.f.name)}</button>`],
+    ['Test', h => { const w = byId('workpapers', h.ev.workpaper_id); return w ? `<button class="link" data-open="wp" data-id="${w.id}">${esc(w.ref)}</button>` : ''; }],
+    ['Found in', h => esc(h.where)], ['Match', h => `<span style="white-space:pre-wrap">${h.snip}</span>`]], hits)
+    : `<div class="empty">No evidence matches &ldquo;${esc(q)}&rdquo;.</div>`;
+}
+function ocrAdminCard(){
+  const o = S.ocr || {};
+  return `<div class="card"><h2>Screenshot OCR</h2>${o.available
+    ? `<p style="margin:0">Engine: <b>${esc(o.engine)}</b> &middot; language: ${esc(o.lang)} &middot; ${o.enhanced ? 'image enhancement on'
+      : 'image enhancement <b>off</b>. Install Pillow on the server (<code>pip install pillow</code>) and restart for better accuracy on small screenshot text.'}</p>
+      <p class="muted">Images attached as evidence are read automatically on the server. Nothing is sent outside your network.</p>`
+    : `<p class="over" style="margin-top:0">OCR is not installed, so screenshots are stored but not read.</p>
+      <p>Install Tesseract on the server and restart Audit Workbench:</p><ul>
+      <li>Ubuntu / Debian: <code>sudo apt install tesseract-ocr</code></li><li>Red Hat / Fedora: <code>sudo dnf install tesseract</code></li>
+      <li>macOS: <code>brew install tesseract</code></li><li>Windows: install the UB Mannheim Tesseract build and add it to PATH, or set <code>AUDIT_TESSERACT</code> to tesseract.exe</li></ul>`}</div>`;
+}
+
 /* ---------- Layout ---------- */
 function render(){
   const app = $('#app');
@@ -583,6 +695,8 @@ function render(){
     ${eng ? `<nav class="sub">${ENG_TABS().map(([k, l]) => `<button data-tab="${k}" class="${S.tab === k && !S.wp ? 'active' : ''}">${l}</button>`).join('')}</nav>` : ''}
     <main id="view">${(eng || S.sec !== 'eng') ? V[eng ? 'eng' : S.sec]() : V.home()}</main>`;
   if (S.me.must_change) passwordDialog(true);
+  scheduleOcrPoll();
+  if (S.sec === 'eng' && S.tab === 'evidence' && !S.wp) showSearch();
 }
 function renderLogin(app){
   dlg.open && dlg.close();
@@ -670,6 +784,7 @@ document.addEventListener('click', e => {
   });
   if (d.csv) return exportCsv(d.csv);
   if (d.loadlog) return run(() => loadLog(d.loadlog));
+  if (d.ocr) return openOcr(d.ocr);
 });
 document.addEventListener('change', e => {
   const t = e.target;
@@ -686,7 +801,11 @@ document.addEventListener('change', e => {
     toast('Uploaded'); await refresh();
   });
 });
-document.addEventListener('input', e => { if (e.target.id === 'att_desc') S.att.desc = e.target.value; });
+document.addEventListener('input', e => {
+  if (e.target.id === 'att_desc') S.att.desc = e.target.value;
+  else if (e.target.id === 'evSearch'){ S.q = e.target.value; showSearch(); }
+  else if (e.target.id === 'ocrFind') highlightOcr(e.target.value);
+});
 window.addEventListener('focus', () => { if (S.me && !dlg.open && !S.busy) run(refresh); });
 // Drag & drop onto a test's evidence panel; ignore drops elsewhere so the browser doesn't navigate away.
 const dropZone = e => e.target.closest && e.target.closest('[data-drop]');

@@ -83,3 +83,13 @@ tr.click{cursor:pointer}tr.click:hover td{background:var(--chip)}
 .dropzone{border:2px dashed var(--line);border-radius:8px;padding:20px;text-align:center;margin:12px 0}
 [data-drop].over-drop .dropzone{border-color:var(--accent);background:var(--chip)}
 label.link{color:var(--accent);cursor:pointer;font-weight:normal}
+dialog.wide{width:min(1200px,calc(100vw - 32px))}
+.ocr-grid{display:grid;gap:16px;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)}
+@media (max-width:800px){.ocr-grid{grid-template-columns:1fr}}
+.ocr-img{border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:72vh;background:var(--bg);cursor:zoom-in}
+.ocr-img img{display:block;max-width:100%}
+.ocr-img.actual{cursor:zoom-out}.ocr-img.actual img{max-width:none}
+.ocr-text{white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.5;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;max-height:50vh;overflow:auto;margin:8px 0}
+mark{background:#ffe066;color:#1d2330;border-radius:2px}
+.ocr-busy{animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
