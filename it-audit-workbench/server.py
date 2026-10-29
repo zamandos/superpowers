@@ -27,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from ocr import OcrEngine, sniff_image
+from ocr import PDF, OcrEngine, kind_of, sniff, sniff_image
 
 ROOT = Path(__file__).resolve().parent
 STATIC = {'/': 'index.html', '/app.js': 'app.js', '/app.css': 'app.css'}
@@ -56,7 +56,7 @@ TABLES = {
     'evidence': ['engagement_id', 'workpaper_id', 'issue_id', 'title', 'purpose', 'type', 'pbc_status', 'requested_from', 'requested_on',
                  'collected_by', 'collected_on', 'notes'],
     'files': ['evidence_id', 'engagement_id', 'name', 'size', 'content_type', 'sha256',
-              'ocr_status', 'ocr_text', 'ocr_confidence', 'ocr_engine', 'ocr_at'],
+              'kind', 'pages', 'ocr_status', 'ocr_text', 'ocr_confidence', 'ocr_method', 'ocr_engine', 'ocr_at'],
     'review_notes': ['engagement_id', 'workpaper_id', 'note', 'status', 'response',
                      'responded_by', 'responded_at', 'cleared_by', 'cleared_at'],
     'issues': ['engagement_id', 'workpaper_id', 'title', 'condition', 'criteria', 'cause', 'effect', 'likelihood', 'impact',
@@ -104,6 +104,8 @@ class Workbench:
         self.data_dir = Path(data_dir)
         self.file_dir = self.data_dir / 'evidence'
         self.file_dir.mkdir(parents=True, exist_ok=True)
+        self.preview_dir = self.data_dir / 'previews'  # rendered PDF pages; safe to delete, rebuilt on demand
+        self.preview_dir.mkdir(exist_ok=True)
         self.db_path = self.data_dir / 'audit.db'
         self.failures = {}
         self.lock = threading.Lock()
@@ -462,7 +464,12 @@ class Workbench:
             label = row.get('name') or row.get('title') or row.get('ref') or row.get('area')
             self._log(c, user, 'delete', table, rid, eng, {'deleted': label} if label else None)
         for fid in file_ids:
-            (self.file_dir / fid).unlink(missing_ok=True)
+            self._remove_stored(fid)
+
+    def _remove_stored(self, fid):
+        (self.file_dir / fid).unlink(missing_ok=True)
+        for p in self.preview_dir.glob(fid + '-*.png'):
+            p.unlink(missing_ok=True)
 
     # ---------- workflows ----------
     def sign_off(self, user, wp_id, kind):
@@ -551,10 +558,10 @@ class Workbench:
 
     def _insert_file(self, c, user, fid, ev, name, content_type, length, sha):
         ts = now()
-        is_image = sniff_image(self.file_dir / fid) is not None
+        mime = sniff(self.file_dir / fid)
         rec = {'id': fid, 'evidence_id': ev['id'], 'engagement_id': ev['engagement_id'], 'name': name, 'size': str(length),
                'content_type': (content_type or 'application/octet-stream')[:100], 'sha256': sha,
-               'ocr_status': ('queued' if self.ocr.available else 'unavailable') if is_image else None,
+               'kind': kind_of(mime), 'ocr_status': ('queued' if self.ocr.can_read(mime) else 'unavailable') if mime else None,
                'created_at': ts, 'created_by': user['id'], 'updated_at': ts, 'updated_by': user['id']}
         c.execute(f'INSERT INTO files ({", ".join(rec)}) VALUES ({", ".join("?" * len(rec))})', list(rec.values()))
         self._log(c, user, 'upload', 'files', fid, ev['engagement_id'], {'name': name, 'sha256': sha, 'evidence_id': ev['id']})
@@ -619,12 +626,14 @@ class Workbench:
     def request_ocr(self, user, fid):
         if user['role'] not in STAFF:
             raise ApiError(403, 'Not permitted.')
-        if not self.ocr.available:
-            raise ApiError(503, 'OCR is not installed on the server. Ask your administrator to install Tesseract.')
         with self.db() as c:
             rec = self._row(c, 'files', fid)
-            if not sniff_image(self.file_dir / fid):
-                raise ApiError(400, 'OCR works on image files (PNG, JPEG, GIF, BMP, TIFF, WebP).')
+            mime = sniff(self.file_dir / fid)
+            if not mime:
+                raise ApiError(400, 'Text can be read from PDFs and images (PNG, JPEG, GIF, BMP, TIFF, WebP).')
+            if not self.ocr.can_read(mime):
+                tool = 'PDF tools (Poppler)' if mime == PDF else 'OCR (Tesseract)'
+                raise ApiError(503, f'{tool} is not installed on the server. Ask your administrator to install it.')
             if rec['ocr_status'] in ('queued', 'running'):
                 return rec
             c.execute("UPDATE files SET ocr_status = 'queued' WHERE id = ?", (fid,))
@@ -648,11 +657,13 @@ class Workbench:
                 return
             c.execute("UPDATE files SET ocr_status = 'running' WHERE id = ?", (fid,))
         try:
-            text, conf = self.ocr.read(self.file_dir / fid)
-            fields = {'ocr_status': 'done', 'ocr_text': text, 'ocr_confidence': None if conf is None else str(conf)}
-            detail = {'name': rec['name'], 'confidence': conf, 'characters': len(text)}
+            r = self.ocr.read(self.file_dir / fid)
+            conf = r['confidence']
+            fields = {'ocr_status': 'done', 'ocr_text': r['text'], 'ocr_confidence': None if conf is None else str(conf),
+                      'ocr_method': r['method'], 'pages': None if r['pages'] is None else str(r['pages'])}
+            detail = {'name': rec['name'], 'method': r['method'], 'confidence': conf, 'characters': len(r['text'])}
         except Exception as e:
-            fields = {'ocr_status': 'failed', 'ocr_text': f'OCR failed: {e}'[:1000], 'ocr_confidence': None}
+            fields = {'ocr_status': 'failed', 'ocr_text': f'Text extraction failed: {e}'[:1000], 'ocr_confidence': None, 'ocr_method': None}
             detail = {'name': rec['name'], 'error': str(e)[:300]}
         fields.update(ocr_engine=self.ocr.version, ocr_at=now())
         with self.db() as c:
@@ -670,6 +681,34 @@ class Workbench:
                 raise ApiError(415, 'Only images can be previewed.')
             self._log(c, user, 'view', 'files', fid, rec['engagement_id'], {'name': rec['name']})
         return mime, self.file_dir / fid
+
+    def view_page(self, user, fid, page):
+        """A PDF page rendered as PNG for the viewer (cached). Rendering avoids running PDF content in the browser."""
+        if user['role'] not in STAFF:
+            raise ApiError(403, 'Not permitted.')
+        with self.db() as c:
+            rec = self._row(c, 'files', fid)
+        if sniff(self.file_dir / fid) != PDF:
+            raise ApiError(415, 'Not a PDF.')
+        if not self.ocr.pdf_available:
+            raise ApiError(503, 'PDF preview needs the PDF tools (Poppler) on the server.')
+        try:
+            page = int(page)
+        except ValueError:
+            raise ApiError(400, 'Invalid page.')
+        pages = int(rec['pages']) if rec['pages'] else self.ocr.pdf_pages(self.file_dir / fid)
+        if not 1 <= page <= pages:
+            raise ApiError(404, 'No such page.')
+        out = self.preview_dir / f'{fid}-{page}.png'
+        if not out.exists():
+            try:
+                self.ocr.render_page(self.file_dir / fid, page, out)
+            except RuntimeError as e:
+                raise ApiError(422, str(e))
+        if page == 1:
+            with self.db() as c:
+                self._log(c, user, 'view', 'files', fid, rec['engagement_id'], {'name': rec['name']})
+        return out
 
     def open_file(self, user, fid):
         if user['role'] not in STAFF:
@@ -691,7 +730,7 @@ class Workbench:
             ev = c.execute('SELECT workpaper_id FROM evidence WHERE id = ?', (rec['evidence_id'],)).fetchone()
             if ev and ev['workpaper_id']:
                 self._invalidate_signoffs(c, user, ev['workpaper_id'], f"evidence removed: {rec['name']}")
-        (self.file_dir / fid).unlink(missing_ok=True)
+        self._remove_stored(fid)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -817,6 +856,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, self.app.ocr.describe())
         elif head == 'files' and len(rest) == 2 and rest[1] == 'ocr' and method == 'POST':
             return self._json(200, app.request_ocr(user, rest[0]))
+        elif head == 'files' and len(rest) == 3 and rest[1] == 'page' and method == 'GET':
+            data = app.view_page(user, rest[0], rest[2]).read_bytes()
+            self._headers(200, 'image/png', len(data), {'Content-Disposition': 'inline'})
+            return self.wfile.write(data)
         elif head == 'files' and len(rest) == 2 and rest[1] == 'view' and method == 'GET':
             mime, path = app.view_image(user, rest[0])
             data = path.read_bytes()
@@ -866,6 +909,7 @@ def main():
         print(f'\nCreated first administrator account.\n  username: admin\n  password: {pw}\n'
               'You will be asked to change it at first sign-in.\n', flush=True)
     o = app.ocr.describe()
+    print(f"PDF text extraction: {'available' if o['pdf'] else 'not available - install Poppler (poppler-utils) to read PDFs'}", flush=True)
     print(f"OCR: {o['engine'] + (' with image enhancement' if o['enhanced'] else ' (install Pillow for better accuracy)') if o['available'] else 'not available - install Tesseract to read screenshots'}", flush=True)
     print(f'Audit Workbench running at http://{a.host}:{a.port}  (data: {a.data})', flush=True)
     try:

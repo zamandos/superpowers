@@ -93,3 +93,4 @@ dialog.wide{width:min(1200px,calc(100vw - 32px))}
 mark{background:#ffe066;color:#1d2330;border-radius:2px}
 .ocr-busy{animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.45}}
+.pager{margin-bottom:8px;justify-content:center}.pager .muted{min-width:110px;text-align:center}

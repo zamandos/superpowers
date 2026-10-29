@@ -409,8 +409,8 @@ const EV = {
     const E = inEng('evidence');
     return `<div class="card"><div class="toolbar"><h2>Evidence &amp; PBC requests</h2><button class="btn" data-new="evidence">New request / evidence</button></div>
       <p class="muted" style="margin-top:0">Files are stored on the server with a SHA-256 fingerprint so you can show they were not altered after collection. Every upload and download is logged.</p>
-      <label for="evSearch" class="muted" style="font-size:12px;font-weight:600">Search evidence, including text read from screenshots</label>
-      <input id="evSearch" type="search" value="${esc(S.q || '')}" placeholder="e.g. lockout threshold, svc-backup, MFA"><div id="evResults" style="margin:8px 0 16px"></div>
+      <label for="evSearch" class="muted" style="font-size:12px;font-weight:600">Search evidence, including text read from screenshots and PDFs</label>
+      <input id="evSearch" type="search" value="${esc(S.q || '')}" placeholder="e.g. lockout threshold, leavers, MFA"><div id="evResults" style="margin:8px 0 16px"></div>
       ${evidenceTable(E)}</div>`;
   },
   notes(){
@@ -522,7 +522,7 @@ function testEvidence(w){
       <div><label for="att_purpose">What is this file?</label><select id="att_purpose">${PURPOSES.map(p => `<option${p === S.att.purpose ? ' selected' : ''}>${esc(p)}</option>`).join('')}</select></div>
       <div><label for="att_desc">Description (optional)</label><input id="att_desc" value="${esc(S.att.desc)}" placeholder="e.g. AD user extraction as at 30 Sep 2026, 1,204 accounts"></div></div>
     <div class="dropzone"><div><b>Drag &amp; drop files here</b> or <label class="btn attach">Choose files<input type="file" multiple hidden data-attach="${w.id}"></label></div>
-      <div class="muted" style="margin-top:6px">Up to ${MAX_MB} MB per file. Each file is fingerprinted (SHA-256) and the upload is logged.</div>
+      <div class="muted" style="margin-top:6px">Up to ${MAX_MB} MB per file. Each file is fingerprinted (SHA-256) and the upload is logged. Text in screenshots and PDFs is read automatically.</div>
       ${signed ? '<div class="over" style="margin-top:6px">This test is signed off. Attaching or removing evidence removes the sign-offs so it can be re-reviewed.</div>' : ''}
       <div id="upProg"></div></div>
     ${rows.length ? table([
@@ -573,15 +573,23 @@ async function attachFiles(wpId, files){
 const OCR_BUSY = ['queued', 'running'];
 const ocrConf = f => f.ocr_confidence != null && f.ocr_confidence !== '' ? Math.round(+f.ocr_confidence) : null;
 function ocrChip(f){
-  if (OCR_BUSY.includes(f.ocr_status)) return '<div><span class="badge ocr-busy">Reading text&hellip;</span></div>';
+  const doc = f.kind === 'pdf';
+  if (OCR_BUSY.includes(f.ocr_status)) return `<div><span class="badge ocr-busy">Reading text&hellip;</span></div>`;
   if (f.ocr_status === 'done'){
-    const c = ocrConf(f);
-    return `<div><button class="link" data-ocr="${f.id}">View image &amp; text</button> ${!f.ocr_text ? badge('no text found')
-      : c != null ? `<span class="badge ${c < 75 ? 'b-Medium' : ''}" title="Average OCR confidence">${c}% confidence</span>` : ''}</div>`;
+    const c = ocrConf(f), pages = doc && f.pages ? `${f.pages} page${+f.pages === 1 ? '' : 's'}` : '';
+    const label = !f.ocr_text ? 'no text found' : f.ocr_method === 'PDF text' ? 'text layer' : c != null ? `${c}% confidence` : '';
+    return `<div><button class="link" data-ocr="${f.id}">View ${doc ? 'document' : 'image'} &amp; text</button>
+      ${pages ? `<span class="muted">${pages}</span>` : ''} ${label ? `<span class="badge ${c != null && c < 75 ? 'b-Medium' : ''}" title="${esc(f.ocr_method || '')}">${label}</span>` : ''}</div>`;
   }
-  if (f.ocr_status === 'failed') return `<div><button class="link" data-ocr="${f.id}">OCR failed &ndash; details</button></div>`;
-  if (f.ocr_status === 'unavailable') return '<div class="muted" title="Install Tesseract on the server to read screenshots">OCR not installed</div>';
+  if (f.ocr_status === 'failed') return `<div><button class="link" data-ocr="${f.id}">Reading failed &ndash; details</button></div>`;
+  if (f.ocr_status === 'unavailable') return `<div class="muted" title="Ask your administrator to install the ${doc ? 'PDF tools (Poppler)' : 'OCR engine (Tesseract)'}">${doc ? 'PDF reading' : 'OCR'} not installed</div>`;
   return '';
+}
+// Page number of a character offset in extracted PDF text (pages are marked "--- Page n ---").
+function pageAt(text, index){
+  let page = null; const re = /^--- Page (\d+) ---$/gm; let m;
+  while ((m = re.exec(text)) && m.index <= index) page = +m[1];
+  return page;
 }
 // While any screenshot is being read, check back every few seconds (but never while someone is typing).
 function scheduleOcrPoll(){
@@ -595,43 +603,63 @@ function scheduleOcrPoll(){
 }
 function openOcr(fid){
   const f = byId('files', fid); if (!f) return;
-  S.ocrFile = fid;
+  const doc = f.kind === 'pdf', pages = +f.pages || 1;
+  S.ocrFile = fid; S.ocrPage = 1; S.ocrSel = '';
   const ev = byId('evidence', f.evidence_id) || {}, w = byId('workpapers', ev.workpaper_id), c = ocrConf(f);
   const text = f.ocr_status === 'done' ? f.ocr_text || '' : '';
+  const lowConf = c != null && c < 75 && text;
   dlg.innerHTML = `<form><div class="toolbar"><h3 style="margin:0;flex:1;min-width:0;overflow-wrap:anywhere">${esc(f.name)}</h3>
       <button type="button" class="btn ghost" data-file="${f.id}" data-name="${esc(f.name)}">Download original</button>
       <button type="button" class="btn ghost" data-close>Close</button></div>
     <div class="ocr-grid">
-      <div class="ocr-img" title="Click to toggle actual size"><img src="/api/files/${f.id}/view" alt="${esc(f.name)}"></div>
-      <div><div class="toolbar" style="margin-bottom:6px"><b style="flex:1">Text read from the image</b>${c != null && text ? badge(c + '% confidence', c < 75 ? 'b-Medium' : '') : ''}</div>
+      <div>${doc ? `<div class="toolbar pager"><button type="button" class="btn ghost" id="pgPrev" aria-label="Previous page">&lsaquo; Prev</button>
+          <span id="pgNum" class="muted"></span><button type="button" class="btn ghost" id="pgNext" aria-label="Next page">Next &rsaquo;</button></div>` : ''}
+        <div class="ocr-img" title="Click to toggle actual size"><img id="ocrImg" alt="${esc(f.name)}"></div></div>
+      <div><div class="toolbar" style="margin-bottom:6px"><b style="flex:1">Text read from the ${doc ? 'document' : 'image'}</b>
+          ${text ? badge(f.ocr_method === 'PDF text' ? 'exact text layer' : c != null ? c + '% confidence' : f.ocr_method || '', lowConf ? 'b-Medium' : '') : ''}</div>
+        ${f.ocr_method && doc ? `<div class="muted" style="font-size:12px;margin-bottom:6px">${esc(f.ocr_method)}</div>` : ''}
         ${f.ocr_status === 'failed' ? `<p class="over">${esc(f.ocr_text)}</p>` : ''}
-        ${c != null && c < 75 && text ? '<p class="over" style="margin:0 0 6px">Low confidence: check every value against the image.</p>' : ''}
-        <input id="ocrFind" type="search" placeholder="Find in text, e.g. password length" aria-label="Find in text">
-        <pre id="ocrText" class="ocr-text">${esc(text || (f.ocr_status === 'done' ? '(No text was found in this image.)' : ''))}</pre>
+        ${lowConf ? '<p class="over" style="margin:0 0 6px">Low confidence: check every value against the original.</p>' : ''}
+        <input id="ocrFind" type="search" placeholder="${doc ? 'Find in document, e.g. leavers' : 'Find in text, e.g. password length'}" aria-label="Find in text">
+        <div id="ocrHits" class="muted" style="font-size:12px;min-height:1.2em"></div>
+        <pre id="ocrText" class="ocr-text">${esc(text || (f.ocr_status === 'done' ? '(No text was found.)' : ''))}</pre>
         <div class="toolbar">${text ? '<button type="button" class="btn" id="ocrCopy">Copy text</button>' : ''}
-          ${w && text ? `<button type="button" class="btn ghost" id="ocrAppend">Add to test results (${esc(w.ref)})</button>` : ''}
-          ${S.ocr && S.ocr.available ? '<button type="button" class="btn ghost" id="ocrRerun">Read again</button>' : ''}</div>
-        <p class="muted" style="font-size:12px">Read by ${esc(f.ocr_engine || 'OCR')}${f.ocr_at ? ' on ' + esc(fmtTs(f.ocr_at)) : ''}.
-          OCR is an aid: verify key values against the screenshot before relying on them. The original image remains the evidence.</p></div></div></form>`;
+          ${w && text ? `<button type="button" class="btn ghost" id="ocrAppend" title="${doc ? 'Select a passage first' : 'Adds the text, or just your selection'}">Add ${doc ? 'selected passage' : 'to test results'}${doc ? ` to ${esc(w.ref)}` : ` (${esc(w.ref)})`}</button>` : ''}
+          ${S.ocr && (doc ? S.ocr.pdf : S.ocr.available) ? '<button type="button" class="btn ghost" id="ocrRerun">Read again</button>' : ''}</div>
+        <p class="muted" style="font-size:12px">${f.ocr_method === 'PDF text' ? 'Text taken from the PDF itself' : `Read by ${esc(f.ocr_engine || 'OCR')}`}${f.ocr_at ? ' on ' + esc(fmtTs(f.ocr_at)) : ''}.
+          The extracted text is a reading aid: verify key values against the original, which remains the evidence.</p></div></div></form>`;
   dlg.classList.add('wide');
   dlg.oncancel = null;
   dlg.querySelector('form').onsubmit = e => e.preventDefault();
   dlg.querySelector('.ocr-img').onclick = e => e.currentTarget.classList.toggle('actual');
+  const show = n => {
+    S.ocrPage = Math.min(Math.max(1, n), pages);
+    $('#ocrImg').src = doc ? `/api/files/${f.id}/page/${S.ocrPage}` : `/api/files/${f.id}/view`;
+    if (doc){ $('#pgNum').textContent = `Page ${S.ocrPage} of ${pages}`; $('#pgPrev').disabled = S.ocrPage === 1; $('#pgNext').disabled = S.ocrPage === pages; }
+  };
+  S.ocrShow = show; show(1);
+  if (doc){ $('#pgPrev').onclick = () => show(S.ocrPage - 1); $('#pgNext').onclick = () => show(S.ocrPage + 1); }
+  const selected = () => S.ocrSel;  // tracked on selectionchange: clicking a button clears the live selection
   const copy = $('#ocrCopy');
   if (copy) copy.onclick = async () => {
-    try { await navigator.clipboard.writeText(text); }
+    const t = selected() || text;
+    try { await navigator.clipboard.writeText(t); }
     catch { const r = document.createRange(); r.selectNodeContents($('#ocrText')); getSelection().removeAllRanges(); getSelection().addRange(r); document.execCommand('copy'); }
-    toast('Text copied');
+    toast(t === text ? 'Text copied' : 'Selection copied');
   };
   const add = $('#ocrAppend');
   if (add) add.onclick = () => run(async () => {
+    const part = selected();
+    if (doc && !part) throw new Error('Select the relevant passage in the text first (e.g. the clause on leavers).');
+    const page = doc ? pageAt(text, text.indexOf(part)) : null;
     if ((w.prepared_by || w.reviewed_by) && !confirm(`${w.ref} is signed off. Changing its results removes the sign-offs. Continue?`)) return;
-    const block = `[Text read by OCR from ${f.name} - verify against the image]\n${text}`;
+    const src = `${f.name}${page ? ', page ' + page : ''}`;
+    const block = doc ? `[Extract from ${src}]\n${part}` : `[Text read by OCR from ${src} - verify against the image]\n${part || text}`;
     await api('PUT', 'workpapers/' + w.id, {notes:(w.notes ? w.notes + '\n\n' : '') + block, _version:w.updated_at});
     dlg.close(); toast(`Added to ${w.ref} results`); await refresh();
   });
   const again = $('#ocrRerun');
-  if (again) again.onclick = () => run(async () => { await api('POST', `files/${f.id}/ocr`, {}); dlg.close(); toast('Reading the image again'); await refresh(); });
+  if (again) again.onclick = () => run(async () => { await api('POST', `files/${f.id}/ocr`, {}); dlg.close(); toast('Reading again'); await refresh(); });
   dlg.showModal();
 }
 const reEscape = q => q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -643,7 +671,15 @@ function markText(text, q){
 function highlightOcr(q){
   const pre = $('#ocrText'), f = byId('files', S.ocrFile);
   if (!pre || !f || !f.ocr_text) return;
-  pre.innerHTML = markText(f.ocr_text, q.trim());
+  q = q.trim();
+  pre.innerHTML = markText(f.ocr_text, q);
+  S.ocrSel = '';
+  const n = q ? pre.querySelectorAll('mark').length : 0, hits = $('#ocrHits');
+  if (f.kind === 'pdf' && n){  // list the pages with matches and show the first one
+    const pages = [...new Set([...f.ocr_text.matchAll(new RegExp(reEscape(q), 'ig'))].map(m => pageAt(f.ocr_text, m.index)))];
+    hits.textContent = `${n} match${n > 1 ? 'es' : ''} on page${pages.length > 1 ? 's' : ''} ${pages.join(', ')}`;
+    if (S.ocrShow && pages[0]) S.ocrShow(pages[0]);
+  } else hits.textContent = q ? `${n} match${n === 1 ? '' : 'es'}` : '';
   pre.querySelector('mark')?.scrollIntoView({block:'center'});
 }
 function showSearch(){
@@ -655,9 +691,10 @@ function showSearch(){
   const hits = [];
   for (const f of inEng('files')){
     const ev = byId('evidence', f.evidence_id) || {};
-    const fields = [['Text in image', f.ocr_text], ['File name', f.name], ['Description', [ev.title, ev.purpose, ev.notes].filter(Boolean).join(' · ')]];
+    const fields = [['Text in file', f.ocr_text], ['File name', f.name], ['Description', [ev.title, ev.purpose, ev.notes].filter(Boolean).join(' · ')]];
     const m = fields.find(([, t]) => t && t.toLowerCase().includes(ql));
-    if (m) hits.push({id:f.id, f, ev, where:m[0], snip:snippet(m[1], m[1].toLowerCase().indexOf(ql))});
+    if (m){ const i = m[1].toLowerCase().indexOf(ql), page = m[0] === 'Text in file' && f.kind === 'pdf' ? pageAt(m[1], i) : null;
+      hits.push({id:f.id, f, ev, where:m[0] + (page ? `, page ${page}` : ''), snip:snippet(m[1], i)}); }
   }
   box.innerHTML = hits.length ? table([
     ['File', h => h.f.ocr_status === 'done' ? `<button class="link" data-ocr="${h.f.id}">${esc(h.f.name)}</button>` : `<button class="link" data-file="${h.f.id}" data-name="${esc(h.f.name)}">${esc(h.f.name)}</button>`],
@@ -667,14 +704,13 @@ function showSearch(){
 }
 function ocrAdminCard(){
   const o = S.ocr || {};
-  return `<div class="card"><h2>Screenshot OCR</h2>${o.available
-    ? `<p style="margin:0">Engine: <b>${esc(o.engine)}</b> &middot; language: ${esc(o.lang)} &middot; ${o.enhanced ? 'image enhancement on'
-      : 'image enhancement <b>off</b>. Install Pillow on the server (<code>pip install pillow</code>) and restart for better accuracy on small screenshot text.'}</p>
-      <p class="muted">Images attached as evidence are read automatically on the server. Nothing is sent outside your network.</p>`
-    : `<p class="over" style="margin-top:0">OCR is not installed, so screenshots are stored but not read.</p>
-      <p>Install Tesseract on the server and restart Audit Workbench:</p><ul>
-      <li>Ubuntu / Debian: <code>sudo apt install tesseract-ocr</code></li><li>Red Hat / Fedora: <code>sudo dnf install tesseract</code></li>
-      <li>macOS: <code>brew install tesseract</code></li><li>Windows: install the UB Mannheim Tesseract build and add it to PATH, or set <code>AUDIT_TESSERACT</code> to tesseract.exe</li></ul>`}</div>`;
+  const ok = (on, label, fix) => `<li>${on ? '&#10003;' : '<span class="over">&#10007;</span>'} ${label}${on ? '' : ` <span class="muted">&ndash; ${fix}</span>`}</li>`;
+  return `<div class="card"><h2>Reading screenshots &amp; PDFs</h2><ul style="margin:0;padding-left:18px;list-style:none">
+    ${ok(o.available, `Screenshot OCR${o.engine ? ` (${esc(o.engine)}, language ${esc(o.lang)})` : ''}`, 'install Tesseract: <code>sudo apt install tesseract-ocr</code> &middot; <code>brew install tesseract</code> &middot; Windows: UB Mannheim installer')}
+    ${ok(o.enhanced, 'Screenshot enhancement for small text', 'install Pillow: <code>pip install pillow</code>')}
+    ${ok(o.pdf, 'PDF text extraction and page previews', 'install Poppler: <code>sudo apt install poppler-utils</code> &middot; <code>brew install poppler</code> &middot; Windows: poppler for Windows, then set <code>AUDIT_POPPLER_DIR</code>')}
+    ${ok(o.pdf && o.available, 'OCR of scanned PDF pages', 'needs both Poppler and Tesseract')}</ul>
+    <p class="muted">Evidence is read on this server; nothing is sent outside your network. Restart Audit Workbench after installing a tool.</p></div>`;
 }
 
 /* ---------- Layout ---------- */
@@ -800,6 +836,11 @@ document.addEventListener('change', e => {
     for (const f of files) await upload(`evidence/${t.dataset.upload}/files`, f);
     toast('Uploaded'); await refresh();
   });
+});
+// Remember the last text selected in the OCR viewer; selections made elsewhere are ignored.
+document.addEventListener('selectionchange', () => {
+  const pre = $('#ocrText'), sel = getSelection();
+  if (pre && sel.rangeCount && pre.contains(sel.anchorNode)) S.ocrSel = sel.toString().trim();
 });
 document.addEventListener('input', e => {
   if (e.target.id === 'att_desc') S.att.desc = e.target.value;

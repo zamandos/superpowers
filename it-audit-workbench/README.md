@@ -2,7 +2,7 @@
 
 Audit Workbench is a self-hosted, multi-user audit management application for IT audit teams. It covers the full cycle from the risk-based audit universe to issue follow-up, with reviewer sign-off and a complete audit trail.
 
-It needs only **Python 3.9+**. Screenshot OCR additionally uses Tesseract if it's installed (see below). There are no packages to install and no internet access is required. Data stays on your own server in a SQLite database and an evidence folder.
+It needs only **Python 3.9+**. Reading screenshots and PDFs additionally uses the free Tesseract and Poppler tools if they're installed (see below). There are no packages to install and no internet access is required. Data stays on your own server in a SQLite database and an evidence folder.
 
 ## Quick start
 
@@ -64,6 +64,15 @@ A few rules keep OCR honest as evidence:
 - Whether a file is an image is decided from its content, not its name.
 - Viewing an image, and each OCR run with its engine version and confidence, is recorded in the audit trail.
 
+**Reading PDFs (policies, procedures, signed approvals).** PDFs attached as evidence are read automatically, page by page:
+- **Digital PDFs**, such as a policy exported from Word, are read from the PDF's own text layer. This is exact, and no OCR is involved.
+- **Scanned pages**, such as a signed approval record, are rendered as images and read with OCR, with a confidence score.
+- **Mixed documents** are handled page by page.
+
+**View document & text** shows the pages with Prev/Next beside the full text, marked with page numbers. **Find** (e.g. "leavers") lists the pages that match and jumps to the first one. **Add selected passage** copies the clause you highlight into the test results, labelled with the file name and page, e.g. `[Extract from IS-04.pdf, page 2]`.
+
+Page previews are rendered on the server as images, so no PDF content runs in the browser. Password-protected PDFs are reported as such, so you can ask the auditee for an unprotected copy. Evidence search covers PDF text and shows the page number of each match.
+
 **Evidence and PBC requests.** Track each request as requested, received, accepted, or rejected and to be resubmitted. Attach files of up to 50 MB each. Each file is stored with a **SHA-256 fingerprint**, and every upload, download and removal is logged.
 
 **Issues.** Findings are written as condition, criteria, cause, effect and recommendation, with a management owner, due date, status and response. **Criticality = likelihood × impact**:
@@ -85,7 +94,7 @@ You can raise an issue straight from a failed workpaper. The **Issue tracker** c
 
 **Audit trail.** Every create, edit (with old → new values), delete, sign-off, upload, download and sign-in is logged. Managers can view it per workpaper, per engagement, or for everything.
 
-## Enabling OCR (optional)
+## Enabling OCR and PDF reading (optional)
 
 OCR needs the free Tesseract engine on the server. Without it, everything else works and screenshots show "OCR not installed". **Admin** shows whether OCR is active.
 
@@ -95,6 +104,8 @@ OCR needs the free Tesseract engine on the server. Without it, everything else w
 | Red Hat / Fedora | `sudo dnf install tesseract` |
 | macOS | `brew install tesseract` |
 | Windows | UB Mannheim Tesseract installer; add it to PATH or set `AUDIT_TESSERACT=C:\Program Files\Tesseract-OCR\tesseract.exe` |
+
+**PDFs** need Poppler: `sudo apt install poppler-utils`, `sudo dnf install poppler-utils`, or `brew install poppler`. On Windows, download a Poppler build and set `AUDIT_POPPLER_DIR` to its `bin` folder. Digital PDFs need only Poppler; scanned PDF pages need Poppler and Tesseract. Large PDFs are capped by `AUDIT_PDF_MAX_PAGES` (default 500 pages) and `AUDIT_PDF_MAX_OCR_PAGES` (default 50 scanned pages per document).
 
 For best accuracy on small screenshot text, also install Pillow (`pip install pillow`). Images are then converted to greyscale and enlarged before reading.
 
