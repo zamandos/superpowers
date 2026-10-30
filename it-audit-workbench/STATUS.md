@@ -1,6 +1,6 @@
 # Project status
 
-Last updated: 2026-10-29. Work happens on branch `ccr-f38b2f08-675gm1` of `zamandos/superpowers`, in the `it-audit-workbench/` folder.
+Last updated: 2026-10-30. Work happens on branch `ccr-f38b2f08-675gm1` of `zamandos/superpowers`, in the `it-audit-workbench/` folder.
 
 ## Built so far
 
@@ -29,6 +29,11 @@ python3 -m unittest discover -s tests      # 41 tests
 ```
 
 Optional tools: `tesseract-ocr` and `poppler-utils` (system packages), and `pillow` (pip).
+
+## Demo and tour
+
+- **Demo data:** `demo/seed_demo.py` loads a realistic fictional engagement (Harbor & Pine Logistics, FY26 ITGC) into a fresh server. The script's header lists the commands and the demo sign-ins.
+- **Screenshot tour:** a private claude.ai artifact, https://claude.ai/artifact/8CZC8A7QAoFZFDWuLosEk7, built from that demo on 2026-10-30. Re-capture it after UI changes.
 
 ## Known limitations
 
